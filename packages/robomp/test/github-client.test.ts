@@ -1,6 +1,7 @@
 import { afterEach, expect, test } from "bun:test";
+import * as net from "node:net";
 import { GitHubClient, GitHubError, TRANSIENT_RETRY_DELAYS } from "../src/github-client";
-import { jsonResponse, mockTransport } from "../src/http";
+import { jsonResponse, mockTransport, sendRequest, TooManyRedirectsError, TransportError } from "../src/http";
 
 const originalDelays = TRANSIENT_RETRY_DELAYS.value;
 afterEach(() => {
@@ -117,8 +118,9 @@ test("get_pull_request parses head repo and author", async () => {
 
 test("get_pull_request parses title and body", async () => {
 	const client = new GitHubClient("tok", {
-		transport: mockTransport(() =>
-			jsonResponse(200, {
+		transport: mockTransport(request => {
+			expect(new URL(request.url).pathname).toBe("/repos/octo/widget/pulls/9");
+			return jsonResponse(200, {
 				number: 9,
 				html_url: "https://github.com/octo/widget/pull/9",
 				title: "Fix crash",
@@ -127,8 +129,8 @@ test("get_pull_request parses title and body", async () => {
 				base: { ref: "main" },
 				state: "open",
 				user: { login: "alice" },
-			}),
-		),
+			});
+		}),
 	});
 	const pr = await client.getPullRequest("octo/widget", 9);
 	expect(pr.title).toBe("Fix crash");
@@ -162,9 +164,10 @@ test("list_pr_files parses changed file summary", async () => {
 
 test("list_pr_files defaults missing patch to empty", async () => {
 	const client = new GitHubClient("tok", {
-		transport: mockTransport(() =>
-			jsonResponse(200, [{ filename: "src/app.py", status: "modified", additions: 5, deletions: 2 }]),
-		),
+		transport: mockTransport(request => {
+			expect(new URL(request.url).pathname).toBe("/repos/octo/widget/pulls/9/files");
+			return jsonResponse(200, [{ filename: "src/app.py", status: "modified", additions: 5, deletions: 2 }]);
+		}),
 	});
 	expect((await client.listPrFiles("octo/widget", 9))[0]!.patch).toBe("");
 });
@@ -173,7 +176,9 @@ test("list_pr_files paginates past first page", async () => {
 	const seenPages: (string | null)[] = [];
 	const client = new GitHubClient("tok", {
 		transport: mockTransport(request => {
-			const page = new URL(request.url).searchParams.get("page");
+			const url = new URL(request.url);
+			expect(url.pathname).toBe("/repos/octo/widget/pulls/9/files");
+			const page = url.searchParams.get("page");
 			seenPages.push(page);
 			if (page === "1") {
 				return jsonResponse(
@@ -230,15 +235,16 @@ test("submit_pr_review posts COMMENT event and inline comments", async () => {
 });
 
 test("submit_pr_review on forgejo uses position payload", async () => {
-	const captured: { body?: unknown } = {};
+	const captured: { path?: string; body?: unknown } = {};
 	const client = new GitHubClient("tok", {
 		platform: "forgejo",
 		transport: mockTransport(async request => {
+			captured.path = new URL(request.url).pathname;
 			captured.body = await request.json();
 			return jsonResponse(200, reviewResponse);
 		}),
 	});
-	await client.submitPrReview({
+	const review = await client.submitPrReview({
 		repo: "octo/widget",
 		pr_number: 9,
 		body: "summary",
@@ -248,6 +254,8 @@ test("submit_pr_review on forgejo uses position payload", async () => {
 			{ path: "src/old.py", line: 5, side: "LEFT", body: "removed-line finding" },
 		],
 	});
+	expect(review.id).toBe(44);
+	expect(captured.path).toBe("/repos/octo/widget/pulls/9/reviews");
 	expect(captured.body).toEqual({
 		body: "summary",
 		event: "COMMENT",
@@ -258,9 +266,17 @@ test("submit_pr_review on forgejo uses position payload", async () => {
 	});
 });
 
-test("204 no content resolves", async () => {
-	const client = new GitHubClient("tok", { transport: mockTransport(() => new Response(null, { status: 204 })) });
-	expect(await client.request("POST", "/repos/o/r/issues/1/assignees", { json: { assignees: ["alice"] } })).toBeNull();
+test("204 no content returns none", async () => {
+	let calls = 0;
+	const client = new GitHubClient("tok", {
+		transport: mockTransport(() => {
+			calls++;
+			return new Response(null, { status: 204 });
+		}),
+	});
+	// addAssignees with an empty list short-circuits without a request; pass one to force the call.
+	expect(await client.addAssignees("o/r", 1, ["alice"])).toBeUndefined();
+	expect(calls).toBe(1);
 });
 
 test("list_closing_pull_requests filters disconnected and closed", async () => {
@@ -440,4 +456,137 @@ test("missing tag and release return null", async () => {
 	});
 	expect(await client.getTagSha("octo/widget", "v1.2.3")).toBeNull();
 	expect(await client.getReleaseByTag("octo/widget", "v1.2.3")).toBeNull();
+});
+
+// ---- transport parity with httpx (redirect credentials, retry classes, limits) ----
+
+test("redirect drops Authorization cross-origin but keeps it same-origin and on https upgrade", async () => {
+	const seen: Record<string, string | null> = {};
+	const client = new GitHubClient("tok", {
+		baseUrl: "http://api.github.com",
+		transport: mockTransport(request => {
+			const url = new URL(request.url);
+			seen[`${url.protocol}//${url.host}${url.pathname}`] = request.headers.get("authorization");
+			if (url.pathname.endsWith("/logs")) {
+				return new Response(null, { status: 302, headers: { location: "https://blob.example/job.txt" } });
+			}
+			if (url.protocol === "http:") {
+				return new Response(null, { status: 301, headers: { location: "https://api.github.com/repos/new/repo" } });
+			}
+			if (url.pathname === "/repos/new/repo") {
+				return new Response(null, { status: 301, headers: { location: "/repos/newer/repo" } });
+			}
+			if (url.host === "blob.example") return new Response("log line", { status: 200 });
+			return jsonResponse(200, {
+				full_name: "newer/repo",
+				default_branch: "main",
+				clone_url: "https://github.com/newer/repo.git",
+				private: false,
+			});
+		}),
+	});
+	expect((await client.getRepo("old/repo")).full_name).toBe("newer/repo");
+	expect(await client.getJobLogTail("octo/widget", 20, 1)).toBe("log line");
+	expect(seen).toEqual({
+		"http://api.github.com/repos/old/repo": "Bearer tok",
+		"https://api.github.com/repos/new/repo": "Bearer tok",
+		"https://api.github.com/repos/newer/repo": "Bearer tok",
+		"http://api.github.com/repos/octo/widget/actions/jobs/20/logs": "Bearer tok",
+		"https://blob.example/job.txt": null,
+	});
+});
+
+async function listen(onSocket: (socket: net.Socket) => void): Promise<{ port: number; close: () => void }> {
+	const server = net.createServer(onSocket);
+	const { promise, resolve } = Promise.withResolvers<number>();
+	server.listen(0, "127.0.0.1", () => resolve((server.address() as net.AddressInfo).port));
+	const port = await promise;
+	return { port, close: () => server.close() };
+}
+
+test("connection refused is retried (httpx ConnectError), even for POST", async () => {
+	TRANSIENT_RETRY_DELAYS.value = [0.01, 0.01];
+	const closed = await listen(() => {});
+	closed.close();
+	let calls = 0;
+	const client = new GitHubClient("tok", {
+		transport: mockTransport(async request => {
+			calls++;
+			// First attempt hits a closed port through real fetch: Bun's own refusal error shape.
+			if (calls === 1) return fetch(`http://127.0.0.1:${closed.port}/`, { method: request.method });
+			return jsonResponse(201, { id: 1, user: { login: "bot" }, body: "hi", created_at: "t" });
+		}),
+	});
+	expect((await client.postComment("octo/widget", 1, "hi")).id).toBe(1);
+	expect(calls).toBe(2);
+});
+
+test("connection reset after send is not retried (httpx ReadError propagates)", async () => {
+	TRANSIENT_RETRY_DELAYS.value = [0.01, 0.01];
+	const server = await listen(socket => socket.once("data", () => socket.destroy()));
+	let calls = 0;
+	const client = new GitHubClient("tok", {
+		baseUrl: `http://127.0.0.1:${server.port}`,
+		transport: mockTransport(request => {
+			calls++;
+			return fetch(request, { redirect: "manual" });
+		}),
+	});
+	try {
+		const err = await client.postComment("octo/widget", 1, "hi").then(
+			() => null,
+			(e: unknown) => e,
+		);
+		expect(err).toBeInstanceOf(Error);
+		expect(err).not.toBeInstanceOf(TransportError);
+		expect(err).not.toBeInstanceOf(GitHubError);
+		expect(calls).toBe(1);
+	} finally {
+		server.close();
+	}
+});
+
+test("stalled response body raises a retryable read timeout", async () => {
+	const stalled = new ReadableStream<Uint8Array>({
+		start(controller) {
+			controller.enqueue(new TextEncoder().encode("partial"));
+		},
+	});
+	const resp = await sendRequest(
+		mockTransport(() => new Response(stalled, { status: 200 })),
+		"https://api.github.com",
+		{ method: "GET", url: "/logs", timeoutMs: 50 },
+	);
+	const err = await resp.text().then(
+		() => null,
+		(e: unknown) => e,
+	);
+	expect(err).toBeInstanceOf(TransportError);
+	expect((err as TransportError).kind).toBe("timeout");
+});
+
+test("more than 20 redirects raises TooManyRedirects without retrying", async () => {
+	let calls = 0;
+	const client = new GitHubClient("tok", {
+		transport: mockTransport(() => {
+			calls++;
+			return new Response(null, { status: 302, headers: { location: "https://api.github.com/repos/o/r" } });
+		}),
+	});
+	await expect(client.getRepo("o/r")).rejects.toBeInstanceOf(TooManyRedirectsError);
+	expect(calls).toBe(21);
+});
+
+test("path segments are escaped like quote(safe='')", async () => {
+	const urls: string[] = [];
+	const client = new GitHubClient("tok", {
+		transport: mockTransport(request => {
+			urls.push(request.url);
+			return new Response(null, { status: 204 });
+		}),
+	});
+	await client.removeIssueLabel("octo/widget", 3, "won't fix (maybe)*!/~");
+	expect(urls).toEqual([
+		"https://api.github.com/repos/octo/widget/issues/3/labels/won%27t%20fix%20%28maybe%29%2A%21%2F~",
+	]);
 });

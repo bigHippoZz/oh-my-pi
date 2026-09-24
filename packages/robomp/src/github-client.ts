@@ -215,6 +215,14 @@ function labelNames(raw: unknown): string[] {
 	return raw.map(lbl => (isMapping(lbl) ? String(lbl.name) : String(lbl)));
 }
 
+/**
+ * Python `urllib.parse.quote(value, safe="")`: percent-encode everything but
+ * `A-Za-z0-9_.-~`. `encodeURIComponent` additionally leaves `!'()*` bare.
+ */
+export function quote(value: string): string {
+	return encodeURIComponent(value).replace(/[!'()*]/g, c => `%${c.charCodeAt(0).toString(16).toUpperCase()}`);
+}
+
 function parseRetryAfter(resp: Response): number | null {
 	const ra = resp.headers.get("retry-after");
 	if (ra) {
@@ -426,7 +434,7 @@ export class GitHubClient {
 
 	/** Resolve a lightweight or annotated tag to its commit SHA. */
 	async getTagSha(repo: string, tag: string): Promise<string | null> {
-		const encoded = encodeURIComponent(tag);
+		const encoded = quote(tag);
 		let data: unknown;
 		try {
 			data = await this.request("GET", `/repos/${repo}/git/ref/tags/${encoded}`);
@@ -446,7 +454,7 @@ export class GitHubClient {
 
 	/** Return the GitHub Release for a tag when one exists. */
 	async getReleaseByTag(repo: string, tag: string): Promise<ReleaseInfo | null> {
-		const encoded = encodeURIComponent(tag);
+		const encoded = quote(tag);
 		try {
 			return releaseFromPayload(obj(await this.request("GET", `/repos/${repo}/releases/tags/${encoded}`)));
 		} catch (exc) {
@@ -647,7 +655,7 @@ export class GitHubClient {
 	/** Remove one label from an issue (or PR). */
 	async removeIssueLabel(repo: string, number: number, label: string): Promise<void> {
 		if (!label) return;
-		await this.request("DELETE", `/repos/${repo}/issues/${number}/labels/${encodeURIComponent(label)}`);
+		await this.request("DELETE", `/repos/${repo}/issues/${number}/labels/${quote(label)}`);
 	}
 
 	/** Adapt canonical host-tool comment shape to the wire schema for this platform. */

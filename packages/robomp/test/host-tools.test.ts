@@ -23,7 +23,7 @@ import {
 	ToolBindings,
 	type ToolBindingsInit,
 } from "../src/host-tools";
-import { type HttpTransport, jsonResponse, mockTransport } from "../src/http";
+import { type HttpTransport, jsonResponse, mockTransport, TransportError } from "../src/http";
 import { pySplitlines } from "../src/pycompat";
 import { type GitTransport, LocalGitTransport, SandboxManager, Workspace } from "../src/sandbox";
 import * as subprocess from "../src/subprocess";
@@ -564,7 +564,7 @@ test("mark_unable keeps needs-info when label transport fails", async () => {
 	const db = makeDb();
 	let comments = 0;
 	const transport = mockTransport(request => {
-		if (new URL(request.url).pathname.endsWith("/labels")) throw new TypeError("connection dropped");
+		if (new URL(request.url).pathname.endsWith("/labels")) throw new TransportError("connection dropped", "connect");
 		comments += 1;
 		return comment201(321, "x");
 	});

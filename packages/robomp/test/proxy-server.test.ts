@@ -273,8 +273,9 @@ describe("GET endpoints", () => {
 	});
 
 	test("issues filters out PRs", async () => {
-		const app = buildApp(buildSettings(tmpPath()), () =>
-			jsonResponse(200, [
+		const app = buildApp(buildSettings(tmpPath()), req => {
+			expect(new URL(req.url).pathname).toBe("/repos/octo/widget/issues");
+			return jsonResponse(200, [
 				{
 					number: 1,
 					title: "first",
@@ -287,39 +288,45 @@ describe("GET endpoints", () => {
 					html_url: "https://example/1",
 				},
 				{ number: 2, title: "pr", pull_request: { url: "x" }, user: { login: "alice" } },
-			]),
-		);
+			]);
+		});
 		const resp = await signedGet(app, "/gh/v1/issues", { repo: "octo/widget" });
 		expect(resp.status).toBe(200);
 		const items = ((await resp.json()) as { items: { number: number }[] }).items;
-		expect(items.map(i => i.number)).toEqual([1]);
+		expect(items).toHaveLength(1);
+		expect(items[0]!.number).toBe(1);
 	});
 
 	test("comments", async () => {
-		const app = buildApp(buildSettings(tmpPath()), () =>
-			jsonResponse(200, [{ id: 1, user: { login: "u" }, body: "hi", created_at: "2026-01-01T00:00:00Z" }]),
-		);
+		const app = buildApp(buildSettings(tmpPath()), req => {
+			expect(new URL(req.url).pathname).toBe("/repos/octo/widget/issues/1/comments");
+			return jsonResponse(200, [{ id: 1, user: { login: "u" }, body: "hi", created_at: "2026-01-01T00:00:00Z" }]);
+		});
 		const resp = await signedGet(app, "/gh/v1/comments", { repo: "octo/widget", number: 1 });
+		expect(resp.status).toBe(200);
 		expect(await resp.json()).toEqual({
 			items: [{ id: 1, author: "u", body: "hi", created_at: "2026-01-01T00:00:00Z" }],
 		});
 	});
 
 	test("review comments", async () => {
-		const app = buildApp(buildSettings(tmpPath()), () =>
-			jsonResponse(200, [
+		const app = buildApp(buildSettings(tmpPath()), req => {
+			expect(new URL(req.url).pathname).toBe("/repos/octo/widget/pulls/1/comments");
+			return jsonResponse(200, [
 				{ id: 9, user: { login: "rev" }, body: "nit", path: "a.py", line: 5, created_at: "2026-01-01T00:00:00Z" },
-			]),
-		);
+			]);
+		});
 		const resp = await signedGet(app, "/gh/v1/review_comments", { repo: "octo/widget", pr_number: 1 });
+		expect(resp.status).toBe(200);
 		const items = ((await resp.json()) as { items: { path: string; line: number }[] }).items;
 		expect(items[0]!.path).toBe("a.py");
 		expect(items[0]!.line).toBe(5);
 	});
 
 	test("pr reviews drop empty bodies", async () => {
-		const app = buildApp(buildSettings(tmpPath()), () =>
-			jsonResponse(200, [
+		const app = buildApp(buildSettings(tmpPath()), req => {
+			expect(new URL(req.url).pathname).toBe("/repos/octo/widget/pulls/1/reviews");
+			return jsonResponse(200, [
 				{
 					id: 11,
 					user: { login: "rev" },
@@ -328,11 +335,13 @@ describe("GET endpoints", () => {
 					submitted_at: "2026-01-01T00:00:00Z",
 				},
 				{ id: 12, user: { login: "rev" }, body: "  ", state: "COMMENTED" },
-			]),
-		);
+			]);
+		});
 		const resp = await signedGet(app, "/gh/v1/pr_reviews", { repo: "octo/widget", pr_number: 1 });
+		expect(resp.status).toBe(200);
 		const items = ((await resp.json()) as { items: { state: string }[] }).items;
-		expect(items.map(i => i.state)).toEqual(["APPROVED"]);
+		expect(items).toHaveLength(1);
+		expect(items[0]!.state).toBe("APPROVED");
 	});
 
 	test("authenticated login", async () => {
@@ -341,6 +350,7 @@ describe("GET endpoints", () => {
 			return jsonResponse(200, { login: "robomp-bot" });
 		});
 		const resp = await signedGet(app, "/gh/v1/authenticated_login");
+		expect(resp.status).toBe(200);
 		expect(await resp.json()).toEqual({ login: "robomp-bot" });
 	});
 
@@ -420,11 +430,13 @@ describe("GET endpoints", () => {
 		const logTail = await signedGet(app, "/gh/v1/job_log_tail", { repo: "octo/widget", job_id: 8, tail: 5000 });
 		const tag = await signedGet(app, "/gh/v1/tag_ref", { repo: "octo/widget", tag: "v1.2.3" });
 		const release = await signedGet(app, "/gh/v1/release_by_tag", { repo: "octo/widget", tag: "v1.2.3" });
-		expect(((await runs.json()) as any).items[0].head_sha).toBe("abc");
-		expect(((await jobs.json()) as any).items[0].failed_steps).toEqual(["bun check"]);
+		expect(((await runs.json()) as { items: { head_sha: string }[] }).items[0]!.head_sha).toBe("abc");
+		expect(((await jobs.json()) as { items: { failed_steps: string[] }[] }).items[0]!.failed_steps).toEqual([
+			"bun check",
+		]);
 		expect(await logTail.json()).toEqual({ text: "install ok\nbun check failed" });
 		expect(await tag.json()).toEqual({ sha: "abc" });
-		expect(((await release.json()) as any).asset_names).toEqual(["omp.tar.gz"]);
+		expect(((await release.json()) as { asset_names: string[] }).asset_names).toEqual(["omp.tar.gz"]);
 		expect(upstream[0]).toContain("head_sha=abc");
 	});
 });
@@ -463,6 +475,7 @@ describe("POST endpoints", () => {
 			"/gh/v1/add_issue_labels",
 			'{"repo":"octo/widget","number":1,"labels":["triage","bug"]}',
 		);
+		expect(resp.status).toBe(200);
 		expect(await resp.json()).toEqual({ labels: ["triage", "bug"] });
 		expect(new URL(captured.req!.url).pathname).toBe("/repos/octo/widget/issues/1/labels");
 		expect(captured.body).toEqual({ labels: ["triage", "bug"] });
@@ -476,6 +489,7 @@ describe("POST endpoints", () => {
 			"/gh/v1/remove_issue_label",
 			'{"repo":"octo/widget","number":1,"label":"needs-info"}',
 		);
+		expect(resp.status).toBe(200);
 		expect(await resp.json()).toEqual({ ok: true });
 		expect(captured.req!.method).toBe("DELETE");
 		expect(new URL(captured.req!.url).pathname).toBe("/repos/octo/widget/issues/1/labels/needs-info");
@@ -489,6 +503,7 @@ describe("POST endpoints", () => {
 			"/gh/v1/add_assignees",
 			'{"repo":"octo/widget","number":1,"assignees":["alice"]}',
 		);
+		expect(resp.status).toBe(200);
 		expect(await resp.json()).toEqual({ ok: true });
 		expect(new URL(captured.req!.url).pathname).toBe("/repos/octo/widget/issues/1/assignees");
 		expect(captured.body).toEqual({ assignees: ["alice"] });
@@ -502,6 +517,7 @@ describe("POST endpoints", () => {
 			"/gh/v1/close_issue",
 			'{"repo":"octo/widget","number":7,"reason":"completed"}',
 		);
+		expect(resp.status).toBe(200);
 		expect(await resp.json()).toEqual({ ok: true });
 		expect(captured.req!.method).toBe("PATCH");
 		expect(new URL(captured.req!.url).pathname).toBe("/repos/octo/widget/issues/7");
@@ -532,6 +548,7 @@ describe("POST endpoints", () => {
 			"/gh/v1/open_pull_request",
 			'{"repo":"octo/widget","head":"feature","base":"main","title":"t","body":"b","draft":false,"maintainer_can_modify":true}',
 		);
+		expect(resp.status).toBe(200);
 		expect(((await resp.json()) as { number: number }).number).toBe(4);
 		expect(new URL(captured.req!.url).pathname).toBe("/repos/octo/widget/pulls");
 		expect(captured.body).toMatchObject({ head: "feature", base: "main", title: "t" });
@@ -545,9 +562,25 @@ describe("POST endpoints", () => {
 			"/gh/v1/request_reviewers",
 			'{"repo":"octo/widget","pr_number":4,"reviewers":["alice"],"team_reviewers":null}',
 		);
+		expect(resp.status).toBe(200);
 		expect(await resp.json()).toEqual({ ok: true });
 		expect(new URL(captured.req!.url).pathname).toBe("/repos/octo/widget/pulls/4/requested_reviewers");
 		expect(captured.body).toEqual({ reviewers: ["alice"] });
+	});
+
+	test.each([
+		["", "invalid json: Expecting value: line 1 column 1 (char 0)"],
+		[
+			'{"repo": "octo/widget",\n "number": 1,}',
+			"invalid json: Expecting property name enclosed in double quotes: line 2 column 14 (char 37)",
+		],
+		['{"repo": "octo/widget"} x', "invalid json: Extra data: line 1 column 25 (char 24)"],
+		["[1, 2]", "json body must be an object"],
+	])("malformed body %p → 400 with Python json.loads detail", async (body, detail) => {
+		const app = buildApp(buildSettings(tmpPath()));
+		const resp = await signedPost(app, "/gh/v1/post_comment", body);
+		expect(resp.status).toBe(400);
+		expect(await resp.json()).toEqual({ detail });
 	});
 
 	test("GitHub error passthrough 422", async () => {

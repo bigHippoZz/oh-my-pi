@@ -27,7 +27,7 @@ import {
 	type WorkflowJobInfo,
 	type WorkflowRunInfo,
 } from "./github-client";
-import { buildUrl, defaultTransport, type HttpTransport, type QueryValue, TransportError } from "./http";
+import { buildUrl, defaultTransport, type HttpTransport, type QueryValue, sendRequest, TransportError } from "./http";
 import { getLogger } from "./logging";
 import { HEADER_SIGNATURE, HEADER_TIMESTAMP, sign } from "./proxy-hmac";
 import type { GitTransport } from "./sandbox";
@@ -67,20 +67,8 @@ function keyBytes(key: string | Uint8Array): Uint8Array {
 }
 
 /** Canonical signing target for a URL: path plus raw query when present. */
-export function requestTarget(url: URL): string {
+function requestTarget(url: URL): string {
 	return url.search ? `${url.pathname}${url.search}` : url.pathname;
-}
-
-async function withTimeout<T>(promise: Promise<T>, seconds: number): Promise<T> {
-	let timer: Timer | undefined;
-	const timeout = new Promise<never>((_resolve, reject) => {
-		timer = setTimeout(() => reject(new TransportError(`timed out after ${seconds}s`, "timeout")), seconds * 1000);
-	});
-	try {
-		return await Promise.race([promise, timeout]);
-	} finally {
-		clearTimeout(timer);
-	}
 }
 
 async function sendSigned(
@@ -97,18 +85,15 @@ async function sendSigned(
 	const body = jsonBody === undefined ? "" : JSON.stringify(jsonBody);
 	const headers = signedHeaders(method, requestTarget(url), body, key);
 	if (jsonBody !== undefined) headers["Content-Type"] = "application/json";
-	const request = new Request(url.href, {
+	// httpx clients here use the default `follow_redirects=False`.
+	return sendRequest(transport, baseUrl, {
 		method,
+		url: url.href,
 		headers,
 		body: jsonBody === undefined ? undefined : body,
-		redirect: "manual",
+		timeoutMs: timeoutSeconds * 1000,
+		followRedirects: false,
 	});
-	try {
-		return await withTimeout(Promise.resolve(transport(request)), timeoutSeconds);
-	} catch (err) {
-		if (err instanceof TransportError) throw err;
-		throw new TransportError(err instanceof Error ? err.message : String(err), "connect", { cause: err });
-	}
 }
 
 function items(data: unknown): unknown[] {

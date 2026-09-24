@@ -58,6 +58,151 @@ function gitErrorResponse(
 	);
 }
 
+const JSON_WS = new Set([" ", "\t", "\n", "\r"]);
+const JSON_ESCAPES = new Set(['"', "\\", "/", "b", "f", "n", "r", "t"]);
+const HEX = /^[0-9a-fA-F]$/;
+const DIGIT = /^[0-9]$/;
+
+class PyJsonError {
+	constructor(
+		readonly msg: string,
+		readonly pos: number,
+	) {}
+}
+
+/**
+ * Locate the first error CPython's C JSON scanner (3.11/3.12) reports for
+ * `text` and render it as `str(json.JSONDecodeError)`; `null` when valid.
+ * Positions are code-point indices, as in Python strings. Mirrors
+ * `JSONDecoder.decode` → `scan_once` → `StopIteration` = "Expecting value".
+ */
+export function pythonJsonDecodeError(text: string): string | null {
+	const s = Array.from(text);
+	const len = s.length;
+	const ws = (idx: number): number => {
+		while (idx < len && JSON_WS.has(s[idx]!)) idx++;
+		return idx;
+	};
+	const hex4 = (from: number): number | null => {
+		let value = 0;
+		for (let i = from; i < from + 4; i++) {
+			if (!HEX.test(s[i]!)) return null;
+			value = value * 16 + Number.parseInt(s[i]!, 16);
+		}
+		return value;
+	};
+	const scanString = (end: number): number => {
+		const begin = end - 1;
+		for (;;) {
+			let next = end;
+			let c = "";
+			for (; next < len; next++) {
+				c = s[next]!;
+				if (c === '"' || c === "\\") break;
+				if (c.codePointAt(0)! <= 0x1f) throw new PyJsonError("Invalid control character at", next);
+			}
+			if (next >= len) throw new PyJsonError("Unterminated string starting at", begin);
+			next++;
+			if (c === '"') return next;
+			if (next === len) throw new PyJsonError("Unterminated string starting at", begin);
+			c = s[next]!;
+			if (c !== "u") {
+				end = next + 1;
+				if (!JSON_ESCAPES.has(c)) throw new PyJsonError("Invalid \\escape", end - 2);
+				continue;
+			}
+			next++;
+			end = next + 4;
+			if (end >= len) throw new PyJsonError("Invalid \\uXXXX escape", next - 1);
+			const cp = hex4(next);
+			if (cp === null) throw new PyJsonError("Invalid \\uXXXX escape", end - 5);
+			if (cp >= 0xd800 && cp <= 0xdbff && end + 6 < len && s[end] === "\\" && s[end + 1] === "u") {
+				end += 6;
+				if (hex4(end - 4) === null) throw new PyJsonError("Invalid \\uXXXX escape", end - 5);
+			}
+		}
+	};
+	const matchNumber = (start: number): number => {
+		let idx = start;
+		if (s[idx] === "-") {
+			idx++;
+			if (idx >= len) throw new PyJsonError("Expecting value", start);
+		}
+		if (s[idx]! >= "1" && s[idx]! <= "9") {
+			idx++;
+			while (idx < len && DIGIT.test(s[idx]!)) idx++;
+		} else if (s[idx] === "0") {
+			idx++;
+		} else {
+			throw new PyJsonError("Expecting value", start);
+		}
+		if (idx < len - 1 && s[idx] === "." && DIGIT.test(s[idx + 1]!)) {
+			idx += 2;
+			while (idx < len && DIGIT.test(s[idx]!)) idx++;
+		}
+		if (idx < len - 1 && (s[idx] === "e" || s[idx] === "E")) {
+			const eStart = idx;
+			idx++;
+			if (idx < len - 1 && (s[idx] === "-" || s[idx] === "+")) idx++;
+			while (idx < len && DIGIT.test(s[idx]!)) idx++;
+			if (!DIGIT.test(s[idx - 1]!)) idx = eStart;
+		}
+		return idx;
+	};
+	const literal = (idx: number, word: string): boolean => s.slice(idx, idx + word.length).join("") === word;
+	const scanOnce = (idx: number): number => {
+		if (idx >= len) throw new PyJsonError("Expecting value", idx);
+		const c = s[idx];
+		if (c === '"') return scanString(idx + 1);
+		if (c === "{") return parseObject(idx + 1);
+		if (c === "[") return parseArray(idx + 1);
+		for (const word of ["null", "true", "false", "NaN", "Infinity", "-Infinity"]) {
+			if (c === word[0] && literal(idx, word)) return idx + word.length;
+		}
+		return matchNumber(idx);
+	};
+	const parseObject = (start: number): number => {
+		let idx = ws(start);
+		if (idx >= len || s[idx] !== "}") {
+			for (;;) {
+				if (idx >= len || s[idx] !== '"') {
+					throw new PyJsonError("Expecting property name enclosed in double quotes", idx);
+				}
+				idx = ws(scanString(idx + 1));
+				if (idx >= len || s[idx] !== ":") throw new PyJsonError("Expecting ':' delimiter", idx);
+				idx = ws(scanOnce(ws(idx + 1)));
+				if (idx < len && s[idx] === "}") break;
+				if (idx >= len || s[idx] !== ",") throw new PyJsonError("Expecting ',' delimiter", idx);
+				idx = ws(idx + 1);
+			}
+		}
+		return idx + 1;
+	};
+	const parseArray = (start: number): number => {
+		let idx = ws(start);
+		if (idx >= len || s[idx] !== "]") {
+			for (;;) {
+				idx = ws(scanOnce(idx));
+				if (idx < len && s[idx] === "]") break;
+				if (idx >= len || s[idx] !== ",") throw new PyJsonError("Expecting ',' delimiter", idx);
+				idx = ws(idx + 1);
+			}
+		}
+		return idx + 1;
+	};
+	try {
+		const end = ws(scanOnce(ws(0)));
+		if (end !== len) throw new PyJsonError("Extra data", end);
+		return null;
+	} catch (err) {
+		if (!(err instanceof PyJsonError)) throw err;
+		const before = s.slice(0, err.pos);
+		const lineno = before.filter(ch => ch === "\n").length + 1;
+		const colno = err.pos - before.lastIndexOf("\n");
+		return `${err.msg}: line ${lineno} column ${colno} (char ${err.pos})`;
+	}
+}
+
 function requireStr(value: unknown, field: string): string {
 	if (typeof value !== "string" || !value) throw new HttpError(400, `missing/invalid '${field}'`);
 	return value;
@@ -586,8 +731,13 @@ export function createProxyApp(settings: Settings, options: { github?: GitHubCli
 		const body = await authenticate(ctx);
 		let data: unknown;
 		try {
-			data = JSON.parse(new TextDecoder().decode(body));
+			// Starlette `request.json()` → `json.loads(bytes)`: UTF-8 (BOM tolerated), strict decode.
+			const text = new TextDecoder("utf-8", { fatal: true }).decode(body);
+			const pyError = pythonJsonDecodeError(text);
+			if (pyError !== null) throw new HttpError(400, `invalid json: ${pyError}`);
+			data = JSON.parse(text);
 		} catch (exc) {
+			if (exc instanceof HttpError) throw exc;
 			throw new HttpError(400, `invalid json: ${exc instanceof Error ? exc.message : String(exc)}`);
 		}
 		if (!isMapping(data)) throw new HttpError(400, "json body must be an object");

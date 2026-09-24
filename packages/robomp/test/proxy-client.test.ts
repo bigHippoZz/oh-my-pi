@@ -6,7 +6,7 @@ import { HeadDriftError } from "../src/git-ops";
 import { GitHubClient, GitHubError } from "../src/github-client";
 import { type HttpTransport, jsonResponse, mockTransport } from "../src/http";
 import { createProxyApp, type ProxyApp } from "../src/proxy/server";
-import { GitHubProxyClient, ProxyGitTransport, requestTarget } from "../src/proxy-client";
+import { GitHubProxyClient, ProxyGitTransport } from "../src/proxy-client";
 import { HEADER_SIGNATURE, HEADER_TIMESTAMP, sign, verify } from "../src/proxy-hmac";
 import { workspaceKey } from "../src/sandbox";
 import { gitSync, tmpPath } from "./helpers";
@@ -79,10 +79,9 @@ function proxyClient(transport: HttpTransport): GitHubProxyClient {
 }
 
 test("signed headers are present and verify", async () => {
-	const captured: { req?: Request; body?: string } = {};
+	const captured: { req: Request; body: string }[] = [];
 	const client = proxyClient(async req => {
-		captured.req = req;
-		captured.body = await req.text();
+		captured.push({ req, body: await req.text() });
 		return jsonResponse(200, {
 			full_name: "octo/widget",
 			default_branch: "main",
@@ -90,14 +89,31 @@ test("signed headers are present and verify", async () => {
 			private: false,
 		});
 	});
-	expect((await client.getRepo("octo/widget")).full_name).toBe("octo/widget");
-	const req = captured.req!;
+	const info = await client.getRepo("octo/widget");
+	expect(info).toEqual({
+		full_name: "octo/widget",
+		default_branch: "main",
+		clone_url: "https://example/octo/widget.git",
+		private: false,
+	});
+	expect(captured).toHaveLength(1);
+	const { req, body } = captured[0]!;
+	const ts = req.headers.get(HEADER_TIMESTAMP);
+	const sig = req.headers.get(HEADER_SIGNATURE);
+	expect(ts).not.toBeNull();
+	expect(sig).not.toBeNull();
+	// Rebuild the signing target from the raw request URL (path + raw query), like httpx `url.query`.
+	const afterAuthority = req.url.slice(req.url.indexOf("/", req.url.indexOf("//") + 2));
+	const queryAt = afterAuthority.indexOf("?");
+	const rawPath = queryAt === -1 ? afterAuthority : afterAuthority.slice(0, queryAt);
+	const rawQuery = queryAt === -1 ? "" : afterAuthority.slice(queryAt + 1);
+	const target = rawQuery ? `${rawPath}?${rawQuery}` : rawPath;
 	const result = verify({
 		method: req.method,
-		path: requestTarget(new URL(req.url)),
-		body: captured.body ?? "",
-		timestamp: req.headers.get(HEADER_TIMESTAMP),
-		signature: req.headers.get(HEADER_SIGNATURE),
+		path: target,
+		body,
+		timestamp: ts,
+		signature: sig,
 		key: HMAC,
 	});
 	expect(result).toEqual({ ok: true, reason: "" });
@@ -239,9 +255,11 @@ test("round trip every endpoint through a real proxy app", async () => {
 	expect(found[0]!.state_reason).toBe("completed");
 	expect(await client.listComments("octo/widget", 1)).toHaveLength(1);
 	const rcs = await client.listReviewComments("octo/widget", 2);
+	expect(rcs).toHaveLength(1);
 	expect(rcs[0]!.line).toBe(5);
 	expect(await client.listPrReviews("octo/widget", 2)).toHaveLength(1);
 	const files = await client.listPrFiles("octo/widget", 2);
+	expect(files).toHaveLength(1);
 	expect(files[0]!.path).toBe("src/app.py");
 	expect(files[0]!.patch).toBe("@@ -8,5 +8,6 @@\n ctx\n-old\n+new\n");
 	const submitted = await client.submitPrReview({
@@ -471,24 +489,33 @@ describe("ProxyGitTransport", () => {
 	});
 
 	test("signed POST headers verify", async () => {
-		const captured: { req?: Request; body?: string } = {};
+		const captured: { req: Request; body: string }[] = [];
 		const transport = gitTransport(async req => {
-			captured.req = req;
-			captured.body = await req.text();
+			captured.push({ req, body: await req.text() });
 			return jsonResponse(200, { pool_dir: "/tmp/x" });
 		});
-		await transport.clonePool({ repo: "octo/widget", cloneUrl: "https://example/widget.git", defaultBranch: "main" });
-		const req = captured.req!;
+		await transport.clonePool({
+			repo: "octo/widget",
+			cloneUrl: "https://example/widget.git",
+			defaultBranch: "main",
+			target: "/tmp/unused",
+		});
+		expect(captured).toHaveLength(1);
+		const { req, body } = captured[0]!;
+		const ts = req.headers.get(HEADER_TIMESTAMP);
+		const sig = req.headers.get(HEADER_SIGNATURE);
+		expect(ts).toBeTruthy();
+		expect(sig).toBeTruthy();
 		const result = verify({
 			method: "POST",
 			path: "/gh/v1/git/clone",
-			body: captured.body!,
-			timestamp: req.headers.get(HEADER_TIMESTAMP),
-			signature: req.headers.get(HEADER_SIGNATURE),
+			body,
+			timestamp: ts,
+			signature: sig,
 			key: HMAC,
 		});
-		expect(result.ok).toBe(true);
-		expect((JSON.parse(captured.body!) as { repo: string }).repo).toBe("octo/widget");
+		expect(result).toEqual({ ok: true, reason: "" });
+		expect((JSON.parse(body) as { repo: string }).repo).toBe("octo/widget");
 	});
 });
 
