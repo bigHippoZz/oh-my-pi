@@ -7,7 +7,8 @@
 	"workspaces": {
 		"packages": [
 			"packages/*",
-			"python/robomp/web"
+			"python/robomp/web",
+			"packages/robomp/web"
 		],
 		"catalog": {
 			"@babel/generator": "^7.29.7",

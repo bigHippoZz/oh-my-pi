@@ -41,7 +41,10 @@ export function pyTupleRepr(values: readonly unknown[]): string {
 }
 
 function dumpString(value: string): string {
-	return JSON.stringify(value).replace(/[\u007f-￿]/g, ch => `\\u${ch.charCodeAt(0).toString(16).padStart(4, "0")}`);
+	return JSON.stringify(value).replace(
+		/[\u0080-\uffff]/g,
+		ch => `\\u${ch.charCodeAt(0).toString(16).padStart(4, "0")}`,
+	);
 }
 
 function dump(value: unknown, indent: number | null, depth: number): string {
