@@ -28,10 +28,11 @@ import {
 	pushRelease as gitPushRelease,
 } from "./git-ops";
 import { getLogger } from "./logging";
-import { chmodFull } from "./posix";
+import { type CacheHit, computeKey as nativesComputeKey, type NativesCache, NativesKeyError } from "./natives-cache";
+import { chmodFull, isOSError, rmtreeIgnoreErrors } from "./posix";
 import { pyRepr } from "./pycompat";
-import { type CacheHit, computeKey as nativesComputeKey, type NativesCache } from "./natives-cache";
 import {
+	CalledProcessError,
 	type CompletedProcess,
 	currentEgid,
 	currentEuid,
@@ -40,8 +41,10 @@ import {
 	type RunOptions,
 	runProcess,
 	SHARED_OMP_GID,
+	SubprocessError,
 	slotIdentity,
 	slotPermissionsActive,
+	TimeoutExpired,
 } from "./subprocess";
 
 const log = getLogger("robomp.sandbox");
@@ -244,7 +247,11 @@ export class LocalGitTransport implements GitTransport {
 
 export const DEFAULT_SANDBOX_SUBPROCESS_TIMEOUT = 120;
 
-/** Run without raising; caller decides on returncode. Output is credential-redacted. */
+/**
+ * Run without raising on a non-zero exit or timeout (124); caller decides on
+ * returncode. Output is credential-redacted. A spawn failure (missing binary
+ * or cwd) propagates as `ProcessSpawnError`, like Python's `OSError`.
+ */
 export async function safeRun(cmd: readonly string[], options: RunOptions = {}): Promise<CompletedProcess> {
 	const timeout = options.timeout === undefined ? DEFAULT_SANDBOX_SUBPROCESS_TIMEOUT : options.timeout;
 	const proc = await runProcess(cmd, { ...options, timeout });
@@ -259,7 +266,7 @@ export async function safeRun(cmd: readonly string[], options: RunOptions = {}):
 	return { ...proc, stdout: redactCredentials(proc.stdout), stderr: redactCredentials(proc.stderr) };
 }
 
-/** Raising helper; timeout surfaces as `GitCommandError` 124. */
+/** Raising helper; timeout surfaces as `GitCommandError` 124, spawn failure as `ProcessSpawnError`. */
 export async function run(
 	cmd: readonly string[],
 	options: { cwd?: string | null; timeout?: number | null } = {},
@@ -271,13 +278,17 @@ export async function run(
 	return proc;
 }
 
-/** Run `git worktree add`, cleaning partial state on failure. */
+/**
+ * Run `git worktree add`, cleaning partial state on a `GitCommandError`
+ * (non-zero exit or 124 timeout). Any other failure (e.g. a spawn
+ * `ProcessSpawnError`) propagates without cleanup, as in Python.
+ */
 export async function worktreeAdd(addCmd: readonly string[], pool: string, repoDir: string): Promise<void> {
 	try {
 		await sandboxDeps.run(addCmd, { cwd: pool });
 	} catch (addErr) {
 		if (!(addErr instanceof GitCommandError)) throw addErr;
-		fs.rmSync(repoDir, { recursive: true, force: true });
+		await rmtreeIgnoreErrors(repoDir);
 		const pruned = await sandboxDeps.safeRun(["git", "worktree", "prune"], { cwd: pool });
 		if (pruned.returncode !== 0) {
 			throw new GitCommandError(["git", "worktree", "prune"], pruned.returncode, pruned.stdout, pruned.stderr, {
@@ -332,6 +343,15 @@ export function reapSlot(slotUid: number | null | undefined): void {
 			if ((err as NodeJS.ErrnoException).code === "ESRCH") continue;
 			log.warning(`failed to kill slot user ${slotUid} process ${pid}: ${err}`);
 		}
+	}
+}
+
+/** Python `Path.is_dir()`: follows symlinks, false on any error. */
+function isDirFollow(p: string): boolean {
+	try {
+		return fs.statSync(p).isDirectory();
+	} catch {
+		return false;
 	}
 }
 
@@ -471,7 +491,12 @@ export function shareGitMetadataWithSlots(repoDir: string, slotUid: number | nul
 	}
 }
 
-/** Hand the workspace tree to the identity that will run repo-local git. */
+/**
+ * Hand the workspace tree to the identity that will run repo-local git.
+ *
+ * `subprocess.run(check=True, timeout=...)` analogue: a non-zero exit throws
+ * `CalledProcessError`, a timeout `TimeoutExpired`.
+ */
 export async function chownWorkspace(wsRoot: string, slotUid: number | null): Promise<void> {
 	if (platformInfo.system() !== "linux") return;
 	if (currentEuid() !== 0) return;
@@ -482,9 +507,8 @@ export async function chownWorkspace(wsRoot: string, slotUid: number | null): Pr
 		["chmod", "-R", "u=rwX,g=rwX,o=", wsRoot],
 	]) {
 		const proc = await runProcess(cmd, { timeout: DEFAULT_SANDBOX_SUBPROCESS_TIMEOUT });
-		if (proc.returncode !== 0) {
-			throw new Error(`Command '${cmd.join(" ")}' returned non-zero exit status ${proc.returncode}.`);
-		}
+		if (proc.timedOut) throw new TimeoutExpired(cmd, DEFAULT_SANDBOX_SUBPROCESS_TIMEOUT, proc.stdout, proc.stderr);
+		if (proc.returncode !== 0) throw new CalledProcessError(proc.returncode, cmd, proc.stdout, proc.stderr);
 	}
 }
 
@@ -493,10 +517,16 @@ export async function chownWorkspace(wsRoot: string, slotUid: number | null): Pr
 const TRASH_PREFIX = ".trash-";
 const NODE_MODULES_SCAN_DEPTH = 4;
 
-/** Locate `node_modules` dirs in a checkout without descending into them. */
+/**
+ * Locate `node_modules` dirs in a checkout without descending into them.
+ *
+ * Mirrors `os.walk(followlinks=False)`: a symlink to a directory is listed
+ * among the directory names (so a symlinked `node_modules` is found and
+ * reclaimed) but never descended into.
+ */
 export function findNodeModules(repoDir: string, maxDepth = NODE_MODULES_SCAN_DEPTH): string[] {
 	const found: string[] = [];
-	if (!fs.existsSync(repoDir) || !fs.statSync(repoDir).isDirectory()) return found;
+	if (!isDirFollow(repoDir)) return found;
 	const walk = (current: string, depth: number): void => {
 		let entries: fs.Dirent[];
 		try {
@@ -504,11 +534,17 @@ export function findNodeModules(repoDir: string, maxDepth = NODE_MODULES_SCAN_DE
 		} catch {
 			return;
 		}
-		const dirs = entries.filter(e => e.isDirectory()).map(e => e.name);
-		if (dirs.includes("node_modules")) found.push(path.join(current, "node_modules"));
+		const dirs: { name: string; symlink: boolean }[] = [];
+		for (const entry of entries) {
+			if (entry.isDirectory()) dirs.push({ name: entry.name, symlink: false });
+			else if (entry.isSymbolicLink() && isDirFollow(path.join(current, entry.name))) {
+				dirs.push({ name: entry.name, symlink: true });
+			}
+		}
+		if (dirs.some(d => d.name === "node_modules")) found.push(path.join(current, "node_modules"));
 		if (depth + 1 >= maxDepth) return;
-		for (const name of dirs) {
-			if (name === ".git" || name === "node_modules") continue;
+		for (const { name, symlink } of dirs) {
+			if (name === ".git" || name === "node_modules" || symlink) continue;
 			walk(path.join(current, name), depth + 1);
 		}
 	};
@@ -547,7 +583,7 @@ export function stageWorkspaceTrash(wsRoot: string): string[] {
 }
 
 async function purgeTrash(staged: readonly string[]): Promise<void> {
-	for (const p of staged) await fs.promises.rm(p, { recursive: true, force: true });
+	for (const p of staged) await rmtreeIgnoreErrors(p);
 }
 
 /** Internal collaborators routed through one object (spy seam for tests). */
@@ -563,6 +599,11 @@ export const sandboxDeps = {
 		process.kill(pid, signal);
 	},
 };
+
+/** Errors that are Python `RuntimeError`s on the natives-key path. */
+function isRuntimeError(err: unknown): err is Error {
+	return err instanceof NativesKeyError || err instanceof GitCommandError;
+}
 
 /** Minimal async mutex (per-repo serialization). */
 export class AsyncMutex {
@@ -871,9 +912,11 @@ export class SandboxManager {
 		try {
 			key = await nativesComputeKey(workspace.repo_dir);
 		} catch (err) {
+			// Python: `except (subprocess.SubprocessError, RuntimeError, OSError)`.
+			if (!(err instanceof SubprocessError || isRuntimeError(err) || isOSError(err))) throw err;
 			log.debug("natives_cache key compute failed", {
 				workspace: workspace.workspace_key,
-				err: redactCredentials(String(err)),
+				err: redactCredentials(err.message),
 			});
 			return;
 		}
@@ -881,10 +924,11 @@ export class SandboxManager {
 		try {
 			hit = cache.populateWorkspace(workspace.repo_full_name, key, nativeDir);
 		} catch (err) {
+			if (!isOSError(err)) throw err;
 			log.warning("natives_cache populate failed", {
 				workspace: workspace.workspace_key,
 				key,
-				err: String(err),
+				err: err.message,
 			});
 			return;
 		}
@@ -932,7 +976,7 @@ export class SandboxManager {
 						cwd: pool,
 					});
 					if (removed.returncode !== 0) {
-						fs.rmSync(repoDir, { recursive: true, force: true });
+						await rmtreeIgnoreErrors(repoDir);
 						needsPrune = true;
 					}
 				} else if (exists(wsRoot)) {
@@ -950,7 +994,7 @@ export class SandboxManager {
 					}
 				}
 			}
-			if (exists(wsRoot)) fs.rmSync(wsRoot, { recursive: true, force: true });
+			if (exists(wsRoot)) await rmtreeIgnoreErrors(wsRoot);
 		});
 	}
 

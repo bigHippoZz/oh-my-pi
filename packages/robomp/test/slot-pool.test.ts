@@ -18,10 +18,12 @@ test("double release rejected", async () => {
 	const pool = new SlotPool([2001]);
 	const slotUid = await pool.acquire();
 	pool.release(slotUid);
+	expect(() => pool.release(slotUid)).toThrow(RangeError);
 	expect(() => pool.release(slotUid)).toThrow(/not acquired/);
 });
 
 test("duplicate slots rejected", () => {
+	expect(() => new SlotPool([2001, 2001])).toThrow(RangeError);
 	expect(() => new SlotPool([2001, 2001])).toThrow(/unique/);
 });
 

@@ -11,7 +11,10 @@
  * `processRunner.run` is the single spawn seam; tests `spyOn` it instead of
  * mutating globals.
  */
+import * as fs from "node:fs";
+import * as os from "node:os";
 import { ptree } from "@oh-my-pi/pi-utils";
+import { pyRepr } from "./pycompat";
 
 export const SHARED_OMP_GID = 2000;
 export const DEFAULT_SUBPROCESS_TIMEOUT_SECONDS = 120;
@@ -92,33 +95,161 @@ function cleanEnv(env: Record<string, string | undefined> | undefined): Record<s
 	return out;
 }
 
+/** Python `repr(float)` for the whole-second timeouts used by callers (`120` -> `120.0`). */
+function pyFloat(value: number): string {
+	return Number.isInteger(value) ? `${value}.0` : String(value);
+}
+
+/** Base of the `subprocess.SubprocessError` family (`CalledProcessError`, `TimeoutExpired`). */
+export class SubprocessError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = "SubprocessError";
+	}
+}
+
+/** Python `subprocess.CalledProcessError`: raised by `check=True` on a non-zero exit. */
+export class CalledProcessError extends SubprocessError {
+	readonly returncode: number;
+	readonly cmd: string[];
+	readonly stdout: string | null;
+	readonly stderr: string | null;
+	constructor(returncode: number, cmd: readonly string[], stdout: string | null = null, stderr: string | null = null) {
+		super(CalledProcessError.format(returncode, cmd));
+		this.name = "CalledProcessError";
+		this.returncode = returncode;
+		this.cmd = [...cmd];
+		this.stdout = stdout;
+		this.stderr = stderr;
+	}
+
+	/** `str(CalledProcessError)`, byte-for-byte. */
+	static format(returncode: number, cmd: readonly string[]): string {
+		const head = `Command '${pyRepr([...cmd])}'`;
+		if (returncode >= 0) return `${head} returned non-zero exit status ${returncode}.`;
+		const name = Object.entries(os.constants.signals).find(([, num]) => num === -returncode)?.[0];
+		return name === undefined
+			? `${head} died with unknown signal ${-returncode}.`
+			: `${head} died with <Signals.${name}: ${-returncode}>.`;
+	}
+}
+
+/** Python `subprocess.TimeoutExpired`. */
+export class TimeoutExpired extends SubprocessError {
+	readonly cmd: string[];
+	readonly timeout: number;
+	readonly stdout: string | null;
+	readonly stderr: string | null;
+	constructor(cmd: readonly string[], timeout: number, stdout: string | null = null, stderr: string | null = null) {
+		super(`Command '${pyRepr([...cmd])}' timed out after ${pyFloat(timeout)} seconds`);
+		this.name = "TimeoutExpired";
+		this.cmd = [...cmd];
+		this.timeout = timeout;
+		this.stdout = stdout;
+		this.stderr = stderr;
+	}
+}
+
+const STRERROR: Record<string, string> = {
+	EPERM: "Operation not permitted",
+	ENOENT: "No such file or directory",
+	E2BIG: "Argument list too long",
+	ENOEXEC: "Exec format error",
+	EAGAIN: "Resource temporarily unavailable",
+	ENOMEM: "Cannot allocate memory",
+	EACCES: "Permission denied",
+	ENOTDIR: "Not a directory",
+	EISDIR: "Is a directory",
+	ETXTBSY: "Text file busy",
+	ENAMETOOLONG: "File name too long",
+	ELOOP: "Too many levels of symbolic links",
+};
+
+/**
+ * Python `OSError` raised by `subprocess.run` when the child cannot start
+ * (missing executable, missing/non-directory `cwd`, not executable). Python
+ * propagates it from `_run`/`_safe_run`/`_run_git`; callers that need the
+ * `FileNotFoundError` case check `code === "ENOENT"`.
+ */
+export class ProcessSpawnError extends Error {
+	/** Positive errno (Python `OSError.errno`). */
+	readonly errno: number;
+	/** Symbolic errno (`ENOENT`, `EACCES`, ...). */
+	readonly code: string;
+	readonly strerror: string;
+	readonly filename: string;
+	constructor(code: string, filename: string) {
+		const errno = (os.constants.errno as Record<string, number | undefined>)[code] ?? 0;
+		const strerror = STRERROR[code] ?? code;
+		super(`[Errno ${errno}] ${strerror}: ${pyRepr(filename)}`);
+		this.name = "ProcessSpawnError";
+		this.errno = errno;
+		this.code = code;
+		this.strerror = strerror;
+		this.filename = filename;
+	}
+}
+
+function errnoCode(err: unknown): string | null {
+	if (!(err instanceof Error)) return null;
+	const code = (err as NodeJS.ErrnoException).code;
+	return typeof code === "string" && /^E[A-Z0-9]+$/.test(code) ? code : null;
+}
+
+/**
+ * The child's `chdir(cwd)` runs before `exec`, so a bad `cwd` is what Python
+ * reports even when the executable is also missing.
+ */
+function cwdSpawnError(cwd: string | null | undefined): ProcessSpawnError | null {
+	if (!cwd) return null;
+	let st: fs.Stats;
+	try {
+		st = fs.statSync(cwd);
+	} catch (err) {
+		return new ProcessSpawnError(errnoCode(err) ?? "ENOENT", cwd);
+	}
+	return st.isDirectory() ? null : new ProcessSpawnError("ENOTDIR", cwd);
+}
+
 async function runImpl(argv: readonly string[], options: RunOptions = {}): Promise<CompletedProcess> {
+	const env = cleanEnv(options.env) ?? cleanEnv(process.env);
+	if (options.identity) {
+		// The setpriv/sh trampoline would turn a missing cwd or executable into
+		// a shell exit 127; Python's `subprocess.run(user=...)` raises instead.
+		const cwdErr = cwdSpawnError(options.cwd);
+		if (cwdErr) throw cwdErr;
+		const exe = argv[0];
+		if (exe !== undefined && Bun.which(exe, { PATH: env?.PATH ?? "", cwd: options.cwd ?? undefined }) === null) {
+			throw new ProcessSpawnError("ENOENT", exe);
+		}
+	}
 	const cmd = options.identity ? wrapWithIdentity(argv, options.identity) : [...argv];
 	const timeoutSeconds = options.timeout === undefined ? DEFAULT_SUBPROCESS_TIMEOUT_SECONDS : options.timeout;
+	let result: ptree.ExecResult;
 	try {
-		const result = await ptree.exec(cmd, {
+		result = await ptree.exec(cmd, {
 			cwd: options.cwd ?? undefined,
-			env: cleanEnv(options.env) ?? cleanEnv(process.env),
+			env,
 			timeout: timeoutSeconds === null ? undefined : Math.max(1, Math.round(timeoutSeconds * 1000)),
 			input: options.input,
 			allowNonZero: true,
 			allowAbort: true,
 			stderr: "full",
 		});
-		const timedOut = result.exitError instanceof ptree.TimeoutError;
-		return {
-			args: [...argv],
-			returncode: timedOut ? 124 : (result.exitCode ?? -1),
-			stdout: result.stdout,
-			stderr: result.stderr,
-			timedOut,
-		};
 	} catch (err) {
-		// Spawn failures (missing binary, bad cwd) mirror Python's OSError surface
-		// as a failed process so callers keep a single error path.
-		const message = err instanceof Error ? err.message : String(err);
-		return { args: [...argv], returncode: 127, stdout: "", stderr: message, timedOut: false };
+		// Spawn failures surface like Python's `OSError` from `subprocess.run`.
+		const code = errnoCode(err);
+		if (code === null) throw err;
+		throw cwdSpawnError(options.cwd) ?? new ProcessSpawnError(code, argv[0] ?? "");
 	}
+	const timedOut = result.exitError instanceof ptree.TimeoutError;
+	return {
+		args: [...argv],
+		returncode: timedOut ? 124 : (result.exitCode ?? -1),
+		stdout: result.stdout,
+		stderr: result.stderr,
+		timedOut,
+	};
 }
 
 /** Spawn seam (tests `spyOn(processRunner, "run")`). */
@@ -126,7 +257,11 @@ export const processRunner = {
 	run: runImpl,
 };
 
-/** Run `argv` and capture output; never throws for a non-zero exit. */
+/**
+ * Run `argv` and capture output. Never throws for a non-zero exit or a
+ * timeout (see `timedOut`); throws `ProcessSpawnError` when the child cannot
+ * start, like Python's `subprocess.run` raising `OSError`.
+ */
 export function runProcess(argv: readonly string[], options?: RunOptions): Promise<CompletedProcess> {
 	return processRunner.run(argv, options);
 }

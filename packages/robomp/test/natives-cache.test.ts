@@ -1,7 +1,8 @@
 import { describe, expect, spyOn, test } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { atomicLink, CACHE_KEY_PATHS, computeKey, NativesCache, NativesKeyError } from "../src/natives-cache";
+import { atomicLink, CACHE_KEY_PATHS, computeKey, NativesCache } from "../src/natives-cache";
+import { CalledProcessError } from "../src/subprocess";
 import { gitSync, tmpPath } from "./helpers";
 
 const REPO = "octo/widget";
@@ -108,8 +109,16 @@ describe("computeKey", () => {
 		]);
 	});
 
-	test("rejects a non-repo", async () => {
-		await expect(computeKey(tmpPath(), "linux-arm64")).rejects.toBeInstanceOf(NativesKeyError);
+	test("rejects a non-repo with CalledProcessError", async () => {
+		const err = await computeKey(tmpPath(), "linux-arm64").then(
+			() => null,
+			(e: unknown) => e,
+		);
+		expect(err).toBeInstanceOf(CalledProcessError);
+		const cpe = err as CalledProcessError;
+		expect(cpe.cmd).toEqual(["git", "cat-file", "--batch-check"]);
+		expect(cpe.returncode).toBe(128);
+		expect(cpe.message).toBe("Command '['git', 'cat-file', '--batch-check']' returned non-zero exit status 128.");
 	});
 });
 
@@ -180,8 +189,42 @@ describe("populate / capture", () => {
 		populateBuiltArtifacts(srcRepo);
 		const key = await computeKey(srcRepo, "linux-arm64");
 		const nativeDir = path.join(srcRepo, "packages/natives/native");
-		const results = await Promise.all([cache.capture(REPO, key, nativeDir), cache.capture(REPO, key, nativeDir)]);
-		expect(results.every(r => typeof r === "string")).toBe(true);
+		// Two OS processes (Python uses two threads) released together by a
+		// file barrier race for the same key under the per-repo flock.
+		const script = path.join(tmp, "capture-worker.ts");
+		fs.writeFileSync(
+			script,
+			[
+				`import { NativesCache } from ${JSON.stringify(path.join(import.meta.dir, "../src/natives-cache.ts"))};`,
+				"const [root, repo, key, nativeDir, ready, go] = process.argv.slice(2);",
+				'await Bun.write(ready, "1");',
+				"while (!(await Bun.file(go).exists())) await Bun.sleep(2);",
+				"console.log(JSON.stringify(await new NativesCache(root).capture(repo, key, nativeDir)));",
+			].join("\n"),
+		);
+		const go = path.join(tmp, "go");
+		const workers = [0, 1].map(i => {
+			const ready = path.join(tmp, `ready-${i}`);
+			const proc = Bun.spawn([process.execPath, script, cache.root, REPO, key, nativeDir, ready, go], {
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			return { ready, proc };
+		});
+		while (!workers.every(w => fs.existsSync(w.ready))) await Bun.sleep(2);
+		fs.writeFileSync(go, "");
+		const results = await Promise.all(
+			workers.map(async ({ proc }) => {
+				const [stdout, stderr, code] = await Promise.all([
+					new Response(proc.stdout).text(),
+					new Response(proc.stderr).text(),
+					proc.exited,
+				]);
+				expect({ code, stderr }).toEqual({ code: 0, stderr: "" });
+				return JSON.parse(stdout) as unknown;
+			}),
+		);
+		expect(results).toEqual([cache.entryDir(REPO, key), cache.entryDir(REPO, key)]);
 		expect([...entries(cache)]).toEqual([key]);
 	});
 
@@ -298,6 +341,44 @@ describe("gc", () => {
 		expect(cache.lookup(REPO, "partial")).toBeNull();
 	});
 });
+
+test.if(process.platform === "linux" && Bun.which("python3") !== null)(
+	"the per-repo lock interlocks with a Python fcntl.flock holder",
+	async () => {
+		const cache = cacheIn(tmpPath());
+		const lockfile = cache.lockfile(REPO);
+		fs.mkdirSync(path.dirname(lockfile), { recursive: true });
+		const holder = Bun.spawn(
+			[
+				"python3",
+				"-c",
+				"import fcntl, sys\n" +
+					"fh = open(sys.argv[1], 'ab+')\n" +
+					"fcntl.flock(fh.fileno(), fcntl.LOCK_EX)\n" +
+					"print('locked', flush=True)\n" +
+					"sys.stdin.readline()\n",
+				lockfile,
+			],
+			{ stdin: "pipe", stdout: "pipe", stderr: "inherit" },
+		);
+		const reader = holder.stdout.getReader();
+		const first = await reader.read();
+		expect(new TextDecoder().decode(first.value)).toBe("locked\n");
+		let settledAt: number | null = null;
+		const gc = cache.gc(REPO).then(n => {
+			settledAt = performance.now();
+			return n;
+		});
+		await Bun.sleep(400);
+		expect(settledAt).toBeNull();
+		const releasedAt = performance.now();
+		holder.stdin.write("\n");
+		await holder.stdin.end();
+		expect(await holder.exited).toBe(0);
+		expect(await gc).toBe(0);
+		expect(settledAt!).toBeGreaterThanOrEqual(releasedAt);
+	},
+);
 
 test("atomicLink replaces an existing target", () => {
 	const tmp = tmpPath();

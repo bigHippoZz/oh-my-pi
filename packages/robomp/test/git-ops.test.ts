@@ -1,7 +1,13 @@
 import { describe, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { GitCommandError, pushRelease, TOKEN_SAFE_CONFIG, tokenUrlSafeConfig } from "../src/git-ops";
+import {
+	GitCommandError,
+	localRemoteSafeDirectory,
+	pushRelease,
+	TOKEN_SAFE_CONFIG,
+	tokenUrlSafeConfig,
+} from "../src/git-ops";
 import { gitSync, tmpPath } from "./helpers";
 
 const AUTH_URL = "https://github.com/octo/widget.git";
@@ -126,5 +132,25 @@ describe("pushRelease", () => {
 		).rejects.toBeInstanceOf(GitCommandError);
 		expect(gitSync(tmp, ["--git-dir", origin, "rev-parse", "refs/heads/main"])).toBe(remoteHead);
 		expect(gitSync(tmp, ["--git-dir", origin, "rev-parse", "refs/tags/v1.2.3"])).toBe(oldHead);
+	});
+});
+
+// Python `Path(urlparse(raw).path)`: no percent-decoding, netloc compared raw.
+describe("localRemoteSafeDirectory", () => {
+	test("keeps file:// paths percent-encoded and never throws on bad escapes", () => {
+		expect(localRemoteSafeDirectory("file:///srv/a%20b/repo.git", "/cwd")).toBe("/srv/a%20b/repo.git");
+		expect(localRemoteSafeDirectory("file:///srv/%zz/repo.git", "/cwd")).toBe("/srv/%zz/repo.git");
+	});
+
+	test("accepts only an empty or localhost netloc and drops query/fragment", () => {
+		expect(localRemoteSafeDirectory("file://localhost/srv//repo.git/?x=1#frag", "/cwd")).toBe("/srv/repo.git");
+		expect(localRemoteSafeDirectory("file://user@localhost/srv/repo.git", "/cwd")).toBeNull();
+		expect(localRemoteSafeDirectory("file://host/srv/repo.git", "/cwd")).toBeNull();
+	});
+
+	test("rejects an unbalanced bracketed netloc like urlparse", () => {
+		expect(() => localRemoteSafeDirectory("file://[::1/srv/repo.git", "/cwd")).toThrow(
+			new RangeError("Invalid IPv6 URL"),
+		);
 	});
 });

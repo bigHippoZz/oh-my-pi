@@ -1,4 +1,7 @@
-/** FIFO pool of per-task slot UIDs (`omp-N` users). An empty pool is a no-op. */
+/**
+ * FIFO pool of per-task slot UIDs (`omp-N` users). An empty pool is a no-op.
+ * Misuse throws `RangeError` (Python `ValueError`).
+ */
 export class SlotPool {
 	readonly #slotUids: readonly number[];
 	readonly #available: number[] = [];
@@ -8,7 +11,7 @@ export class SlotPool {
 	constructor(slotUids: Iterable<number> = []) {
 		this.#slotUids = [...slotUids];
 		if (new Set(this.#slotUids).size !== this.#slotUids.length) {
-			throw new Error("slot UIDs must be unique");
+			throw new RangeError("slot UIDs must be unique");
 		}
 		this.#available.push(...this.#slotUids);
 	}
@@ -34,7 +37,7 @@ export class SlotPool {
 	release(slotUid: number | null): void {
 		if (this.#slotUids.length === 0 && slotUid === null) return;
 		if (slotUid === null || !this.#checkedOut.has(slotUid)) {
-			throw new Error("slot UID was not acquired");
+			throw new RangeError("slot UID was not acquired");
 		}
 		this.#checkedOut.delete(slotUid);
 		const waiter = this.#waiters.shift();

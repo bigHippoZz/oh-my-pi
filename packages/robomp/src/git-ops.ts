@@ -13,8 +13,10 @@
  * expose.
  */
 import * as fs from "node:fs";
+import * as net from "node:net";
 import * as path from "node:path";
 import { getLogger } from "./logging";
+import { pyRepr } from "./pycompat";
 import { type CompletedProcess, type ProcessIdentity, processEnv, runProcess, slotIdentity } from "./subprocess";
 
 const log = getLogger("robomp.git_ops");
@@ -137,17 +139,122 @@ export function appendSafeDirectory(env: Record<string, string>, repoDir: string
 	env.GIT_CONFIG_COUNT = String(count + 1);
 }
 
+/**
+ * `urllib.parse.urlsplit(url)` for a `file://` URL: `[netloc, path]`, with
+ * no percent-decoding. Throws `RangeError` (Python `ValueError`) exactly
+ * where urlsplit does: unbalanced/invalid bracketed hosts and netlocs that
+ * change meaning under NFKC normalization.
+ */
+export function pyUrlsplitFile(url: string): { netloc: string; path: string } {
+	// urlsplit lstrips C0 controls/space and drops tab/CR/LF anywhere.
+	let rest = url.replace(/^[\x00-\x20]+/, "").replace(/[\t\r\n]/g, "");
+	const colon = rest.indexOf(":");
+	if (colon > 0 && /^[A-Za-z][A-Za-z0-9+\-.]*$/.test(rest.slice(0, colon))) rest = rest.slice(colon + 1);
+	let netloc = "";
+	if (rest.startsWith("//")) {
+		let end = rest.length;
+		for (const ch of "/?#") {
+			const idx = rest.indexOf(ch, 2);
+			if (idx >= 0) end = Math.min(end, idx);
+		}
+		netloc = rest.slice(2, end);
+		rest = rest.slice(end);
+		const open = netloc.includes("[");
+		const close = netloc.includes("]");
+		if (open !== close) throw new RangeError("Invalid IPv6 URL");
+		if (open && close) checkBracketedNetloc(netloc);
+	}
+	const hash = rest.indexOf("#");
+	if (hash >= 0) rest = rest.slice(0, hash);
+	const query = rest.indexOf("?");
+	if (query >= 0) rest = rest.slice(0, query);
+	checkNetlocNfkc(netloc);
+	return { netloc, path: rest };
+}
+
+function checkBracketedNetloc(netloc: string): void {
+	const hostAndPort = netloc.slice(netloc.lastIndexOf("@") + 1);
+	const openIdx = hostAndPort.indexOf("[");
+	let hostname: string;
+	if (openIdx >= 0) {
+		if (openIdx > 0) throw new RangeError("Invalid IPv6 URL");
+		const bracketed = hostAndPort.slice(openIdx + 1);
+		const closeIdx = bracketed.indexOf("]");
+		hostname = closeIdx >= 0 ? bracketed.slice(0, closeIdx) : bracketed;
+		const port = closeIdx >= 0 ? bracketed.slice(closeIdx + 1) : "";
+		if (port && !port.startsWith(":")) throw new RangeError("Invalid IPv6 URL");
+	} else {
+		const colonIdx = hostAndPort.indexOf(":");
+		hostname = colonIdx >= 0 ? hostAndPort.slice(0, colonIdx) : hostAndPort;
+	}
+	if (hostname.startsWith("v")) {
+		if (!/^v[a-fA-F0-9]+\.[\s\S]+$/.test(hostname)) throw new RangeError("IPvFuture address is invalid");
+		return;
+	}
+	if (net.isIPv4(hostname)) throw new RangeError("An IPv4 address cannot be in brackets");
+	if (!net.isIPv6(hostname)) {
+		throw new RangeError(`${pyRepr(hostname)} does not appear to be an IPv4 or IPv6 address`);
+	}
+}
+
+function checkNetlocNfkc(netloc: string): void {
+	if (!netloc || /^[\x00-\x7f]*$/.test(netloc)) return;
+	const n = netloc.replace(/[@:#?]/g, "");
+	const normalized = n.normalize("NFKC");
+	if (n === normalized) return;
+	for (const ch of "/?#@:") {
+		if (normalized.includes(ch)) {
+			throw new RangeError(`netloc '${netloc}' contains invalid characters under NFKC normalization`);
+		}
+	}
+}
+
+/** `str(pathlib.PurePosixPath(p))`: collapse `//` and `.` segments, drop the trailing slash. */
+export function pyPosixPath(p: string): string {
+	if (p === "") return ".";
+	const leading = p.startsWith("//") && !p.startsWith("///") ? "//" : p.startsWith("/") ? "/" : "";
+	const parts = p.split("/").filter(part => part !== "" && part !== ".");
+	const body = parts.join("/");
+	return leading + body || ".";
+}
+
+/**
+ * `pathlib.Path.resolve()` (non-strict `os.path.realpath`): walk components,
+ * resolving symlinks of those that exist and applying `..` to the resolved
+ * prefix; missing components are kept verbatim.
+ */
+function pyResolve(p: string): string {
+	const absolute = p.startsWith("/") ? p : `${process.cwd()}/${p}`;
+	let current = "/";
+	for (const part of absolute.split("/")) {
+		if (part === "" || part === ".") continue;
+		if (part === "..") {
+			current = path.dirname(current);
+			continue;
+		}
+		const next = path.join(current, part);
+		try {
+			current = fs.realpathSync(next);
+		} catch {
+			current = next;
+		}
+	}
+	return current;
+}
+
 /** Return a local filesystem remote path that git may need whitelisted. */
 export function localRemoteSafeDirectory(remoteUrl: string, cwd: string): string | null {
 	const raw = remoteUrl.trim();
 	if (!raw) return null;
 	if (raw.startsWith("file://")) {
-		const parsed = new URL(raw);
-		if (parsed.host !== "" && parsed.host !== "localhost") return null;
-		return decodeURIComponent(parsed.pathname);
+		// Python `Path(urlparse(raw).path)`: the path is NOT percent-decoded.
+		const parsed = pyUrlsplitFile(raw);
+		if (parsed.netloc !== "" && parsed.netloc !== "localhost") return null;
+		return pyPosixPath(parsed.path);
 	}
 	if (raw.includes("://") || /^[^/\\s]+:/.test(raw)) return null;
-	return path.isAbsolute(raw) ? raw : path.resolve(cwd, raw);
+	const local = pyPosixPath(raw);
+	return path.isAbsolute(local) ? local : pyResolve(`${cwd}/${local}`);
 }
 
 /** Hard wall-clock cap on any one `git` invocation (seconds). */

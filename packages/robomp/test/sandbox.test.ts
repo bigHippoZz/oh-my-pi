@@ -16,6 +16,7 @@ import { computeKey, NativesCache, targetTriple } from "../src/natives-cache";
 import {
 	chownWorkspace,
 	DEFAULT_SANDBOX_SUBPROCESS_TIMEOUT,
+	findNodeModules,
 	type GitTransport,
 	makeBranch,
 	prepareSlotRuntimeEnv,
@@ -35,7 +36,16 @@ import {
 	worktreeAdd,
 } from "../src/sandbox";
 import * as subprocess from "../src/subprocess";
-import { type CompletedProcess, type RunOptions, platformInfo, processRunner, slotIdentity } from "../src/subprocess";
+import {
+	CalledProcessError,
+	type CompletedProcess,
+	ProcessSpawnError,
+	type RunOptions,
+	platformInfo,
+	processRunner,
+	slotIdentity,
+	TimeoutExpired,
+} from "../src/subprocess";
 import { gitSync, tmpPath } from "./helpers";
 
 afterEach(() => {
@@ -250,6 +260,7 @@ describe("ensureWorkspace", () => {
 			defaultBranch: "main",
 			...AUTHOR,
 		});
+		expect(fs.statSync(ws.repo_dir).isDirectory()).toBe(true);
 		expect(fs.readFileSync(path.join(ws.repo_dir, "README.md"), "utf-8")).toBe("hello\n");
 		expect(gitSync(ws.repo_dir, ["-C", ws.repo_dir, "rev-parse", "--abbrev-ref", "HEAD"])).toBe(ws.branch);
 		expect(ws.branch.startsWith("farm/")).toBe(true);
@@ -408,6 +419,58 @@ describe("chownWorkspace", () => {
 			["chmod", "-R", "u=rwX,g=rwX,o=", tmp],
 		]);
 	});
+
+	// Python runs both commands with `check=True`: a failing chown raises
+	// CalledProcessError before chmod runs.
+	test("check=True: a failing chown raises CalledProcessError and skips chmod", async () => {
+		fakeLinuxRoot();
+		spyOn(platformInfo, "getegid").mockReturnValue(0);
+		const tmp = tmpPath();
+		const calls: (readonly string[])[] = [];
+		spyOn(processRunner, "run").mockImplementation(async cmd => {
+			calls.push(cmd);
+			return done(cmd, cmd[0] === "chown" ? 1 : 0, "", "chown: changing ownership: Operation not permitted");
+		});
+		const err = await chownWorkspace(tmp, null).then(
+			() => null,
+			(e: unknown) => e,
+		);
+		expect(err).toBeInstanceOf(CalledProcessError);
+		const cpe = err as CalledProcessError;
+		expect(cpe.returncode).toBe(1);
+		expect(cpe.cmd).toEqual(["chown", "-R", "0:0", tmp]);
+		expect(cpe.message).toBe(`Command '['chown', '-R', '0:0', '${tmp}']' returned non-zero exit status 1.`);
+		expect(calls).toEqual([["chown", "-R", "0:0", tmp]]);
+	});
+
+	test("check=True: a failing chmod raises CalledProcessError", async () => {
+		fakeLinuxRoot();
+		const tmp = tmpPath();
+		spyOn(processRunner, "run").mockImplementation(async cmd => done(cmd, cmd[0] === "chmod" ? 2 : 0));
+		const err = await chownWorkspace(tmp, 2001).then(
+			() => null,
+			(e: unknown) => e,
+		);
+		expect(err).toBeInstanceOf(CalledProcessError);
+		expect((err as CalledProcessError).returncode).toBe(2);
+		expect((err as CalledProcessError).message).toBe(
+			`Command '['chmod', '-R', 'u=rwX,g=rwX,o=', '${tmp}']' returned non-zero exit status 2.`,
+		);
+	});
+
+	test("a timed-out chown raises TimeoutExpired", async () => {
+		fakeLinuxRoot();
+		const tmp = tmpPath();
+		spyOn(processRunner, "run").mockImplementation(async cmd => ({ ...done(cmd, -9), timedOut: true }));
+		const err = await chownWorkspace(tmp, 2001).then(
+			() => null,
+			(e: unknown) => e,
+		);
+		expect(err).toBeInstanceOf(TimeoutExpired);
+		expect((err as TimeoutExpired).message).toBe(
+			`Command '['chown', '-R', '2001:2001', '${tmp}']' timed out after 120.0 seconds`,
+		);
+	});
 });
 
 describe("slot processes", () => {
@@ -475,6 +538,7 @@ describe("runtime dirs", () => {
 		fs.mkdirSync(target);
 		fs.symlinkSync(target, path.join(tmp, ".omp-tmp"));
 		const prepared = prepareSlotTmpdir(makeWorkspace(tmp));
+		expect(prepared).toBe(path.join(tmp, ".omp-tmp"));
 		expect(fs.lstatSync(prepared).isDirectory()).toBe(true);
 		expect(fs.lstatSync(prepared).isSymbolicLink()).toBe(false);
 		expect(fs.statSync(target).isDirectory()).toBe(true);
@@ -698,6 +762,7 @@ describe("ensureWorkspace permissions", () => {
 		const tmp = tmpPath();
 		const upstream = upstreamRepo(tmp);
 		const runtimePaths: string[] = [];
+		const owned = new Map<string, [number, number]>();
 		const realChown = sandboxDeps.chownWorkspace;
 		spyOn(sandboxDeps, "chownWorkspace").mockImplementation(async (root, slotUid) => {
 			expect(slotUid).not.toBeNull();
@@ -711,7 +776,10 @@ describe("ensureWorkspace permissions", () => {
 				".omp-xdg/cache/omp",
 				".omp-xdg/cache/bun-install",
 			].map(rel => path.join(root, rel));
-			for (const p of paths) expect(fs.statSync(p).isDirectory()).toBe(true);
+			for (const p of paths) {
+				expect(fs.statSync(p).isDirectory()).toBe(true);
+				owned.set(p, [slotUid!, slotUid!]);
+			}
 			runtimePaths.push(...paths);
 			await realChown(root, slotUid);
 		});
@@ -725,8 +793,22 @@ describe("ensureWorkspace permissions", () => {
 			slotUid: 2001,
 			...AUTHOR,
 		});
-		expect(runtimePaths).toHaveLength(8);
-		expect(runtimePaths.every(p => p.startsWith(ws.root))).toBe(true);
+		expect(runtimePaths.length).toBeGreaterThan(0);
+		expect(new Set(runtimePaths)).toEqual(
+			new Set(
+				[
+					".omp-tmp",
+					".omp-xdg/data",
+					".omp-xdg/data/omp",
+					".omp-xdg/state",
+					".omp-xdg/state/omp",
+					".omp-xdg/cache",
+					".omp-xdg/cache/omp",
+					".omp-xdg/cache/bun-install",
+				].map(rel => path.join(ws.root, rel)),
+			),
+		);
+		expect(new Set([...owned.values()].map(pair => pair.join(":")))).toEqual(new Set(["2001:2001"]));
 	});
 
 	test("is idempotent", async () => {
@@ -802,6 +884,7 @@ describe("removeWorkspace", () => {
 			defaultBranch: "main",
 			...AUTHOR,
 		});
+		expect(fs.existsSync(ws.repo_dir)).toBe(true);
 		await mgr.removeWorkspace({ repo: "octo/widget", number: 12 });
 		expect(fs.existsSync(ws.repo_dir)).toBe(false);
 		expect(fs.existsSync(ws.root)).toBe(false);
@@ -863,6 +946,7 @@ describe("removeWorkspace", () => {
 			...AUTHOR,
 		});
 		const pool = mgr.poolPath("octo/widget");
+		expect(fs.existsSync(ws.repo_dir)).toBe(true);
 		expect(git(["-C", pool, "worktree", "list", "--porcelain"], tmp)).toContain(ws.repo_dir);
 		const realSafeRun = sandboxDeps.safeRun;
 		spyOn(sandboxDeps, "safeRun").mockImplementation(async (cmd, options) =>
@@ -895,7 +979,8 @@ describe("removeWorkspace", () => {
 
 	test("prunes when the checkout is already gone on entry", async () => {
 		const mgr = new SandboxManager(tmpPath());
-		const { wsRoot } = stagePoolAndRepo(mgr, 33, false);
+		const { wsRoot, repoDir } = stagePoolAndRepo(mgr, 33, false);
+		expect(fs.existsSync(repoDir)).toBe(false);
 		const calls: string[] = [];
 		spyOn(sandboxDeps, "safeRun").mockImplementation(async cmd => {
 			calls.push(cmd.join(" "));
@@ -923,6 +1008,9 @@ describe("removeWorkspace", () => {
 	test("skips prune on a repeat close after full cleanup", async () => {
 		const mgr = new SandboxManager(tmpPath());
 		fs.mkdirSync(path.join(mgr.poolPath("o/r"), ".git"), { recursive: true });
+		const wsRoot = mgr.workspaceRoot("o/r", 43);
+		expect(fs.existsSync(wsRoot)).toBe(false);
+		expect(fs.existsSync(path.join(wsRoot, "repo"))).toBe(false);
 		const safe = spyOn(sandboxDeps, "safeRun").mockImplementation(async cmd => done(cmd));
 		await mgr.removeWorkspace({ repo: "o/r", number: 43 });
 		expect(safe).not.toHaveBeenCalled();
@@ -949,8 +1037,10 @@ describe("credential redaction", () => {
 			(e: unknown) => e as Error,
 		);
 		expect(err).not.toBeNull();
-		expect(err!.message).not.toContain("ghp_abc123secret");
-		expect(err!.message).not.toContain("https://bot:");
+		const text = err!.message;
+		expect(text).not.toContain("ghp_abc123secret");
+		expect(text).not.toContain("https://bot:");
+		expect(text.includes("***") || text.includes("example.invalid")).toBe(true);
 	});
 });
 
@@ -1222,7 +1312,45 @@ describe("natives cache integration", () => {
 			defaultBranch: "main",
 			...AUTHOR,
 		});
+		expect(fs.statSync(ws.repo_dir).isDirectory()).toBe(true);
 		expect(fs.existsSync(path.join(ws.repo_dir, "packages/natives/native"))).toBe(false);
+	});
+
+	// Python catches only (SubprocessError, RuntimeError, OSError) from the key
+	// and OSError from populate; anything else is a bug and must surface.
+	test("a non-git worktree's CalledProcessError is swallowed as no-cache", async () => {
+		const tmp = tmpPath();
+		const cache = new NativesCache(path.join(tmp, "natives-cache"));
+		const mgr = new SandboxManager(path.join(tmp, "workspaces"), { nativesCache: cache });
+		const ws = makeWorkspace(path.join(tmp, "ws"));
+		fs.mkdirSync(ws.repo_dir, { recursive: true });
+		const populate = spyOn(cache, "populateWorkspace");
+		await mgr.populateNativesCache(ws);
+		expect(populate).not.toHaveBeenCalled();
+	});
+
+	test("populate swallows OSError but propagates other errors", async () => {
+		const tmp = tmpPath();
+		const upstream = upstreamRepo(tmp);
+		const cache = new NativesCache(path.join(tmp, "natives-cache"));
+		const mgr = new SandboxManager(path.join(tmp, "workspaces"), { nativesCache: cache });
+		const ws = await mgr.ensureWorkspace({
+			repo: "octo/widget",
+			number: 14,
+			title: "populate errors",
+			cloneUrl: upstream,
+			defaultBranch: "main",
+			...AUTHOR,
+		});
+		const populate = spyOn(cache, "populateWorkspace").mockImplementation(() => {
+			throw Object.assign(new Error("EACCES: permission denied, link"), { code: "EACCES", errno: -13 });
+		});
+		await mgr.populateNativesCache(ws);
+		expect(populate).toHaveBeenCalledTimes(1);
+		populate.mockImplementation(() => {
+			throw new TypeError("not an OSError");
+		});
+		await expect(mgr.populateNativesCache(ws)).rejects.toBeInstanceOf(TypeError);
 	});
 });
 
@@ -1373,9 +1501,10 @@ describe("repo lock", () => {
 describe("timeouts", () => {
 	test("safeRun timeout returns 124", async () => {
 		const seen: { timeout?: number | null } = {};
+		// A non-124 exit with `timedOut` proves safeRun maps the timeout itself.
 		spyOn(processRunner, "run").mockImplementation(async (cmd, options) => {
 			seen.timeout = options?.timeout;
-			return { ...done(cmd, 124), timedOut: true };
+			return { ...done(cmd, -9), timedOut: true };
 		});
 		expect((await safeRun(["git", "status"])).returncode).toBe(124);
 		expect(seen.timeout).toBe(DEFAULT_SANDBOX_SUBPROCESS_TIMEOUT);
@@ -1385,7 +1514,7 @@ describe("timeouts", () => {
 		const seen: { timeout?: number | null } = {};
 		spyOn(processRunner, "run").mockImplementation(async (cmd, options) => {
 			seen.timeout = options?.timeout;
-			return { ...done(cmd, 124), timedOut: true };
+			return { ...done(cmd, -9), timedOut: true };
 		});
 		const err = await run(["git", "status"]).then(
 			() => null,
@@ -1439,6 +1568,36 @@ describe("timeouts", () => {
 		expect(err?.cause).toBe(addErr);
 	});
 
+	// Python lets OSError from `subprocess.run` propagate out of _safe_run/_run;
+	// only GitCommandError triggers the worktree-add cleanup.
+	test("safeRun propagates a spawn failure as ProcessSpawnError", async () => {
+		const missingBin = "robomp-definitely-missing-binary";
+		const err = await safeRun([missingBin]).then(
+			() => null,
+			(e: unknown) => e,
+		);
+		expect(err).toBeInstanceOf(ProcessSpawnError);
+		expect((err as ProcessSpawnError).code).toBe("ENOENT");
+		expect((err as ProcessSpawnError).message).toBe(`[Errno 2] No such file or directory: '${missingBin}'`);
+	});
+
+	test("worktreeAdd does not clean up after a spawn failure", async () => {
+		const tmp = tmpPath();
+		const pool = path.join(tmp, "missing-pool");
+		const repoDir = path.join(tmp, "ws", "repo");
+		fs.mkdirSync(repoDir, { recursive: true });
+		fs.writeFileSync(path.join(repoDir, "leftover"), "partial");
+		const safe = spyOn(sandboxDeps, "safeRun");
+		const err = await worktreeAdd(["git", "worktree", "add", repoDir, "main"], pool, repoDir).then(
+			() => null,
+			(e: unknown) => e,
+		);
+		expect(err).toBeInstanceOf(ProcessSpawnError);
+		expect((err as ProcessSpawnError).message).toBe(`[Errno 2] No such file or directory: '${pool}'`);
+		expect(fs.existsSync(path.join(repoDir, "leftover"))).toBe(true);
+		expect(safe).not.toHaveBeenCalled();
+	});
+
 	test("ensureClone fails before fetch when the origin probe times out", async () => {
 		const mgr = new SandboxManager(path.join(tmpPath(), "workspaces"));
 		fs.mkdirSync(path.join(mgr.poolPath("octo/widget"), ".git"), { recursive: true });
@@ -1464,6 +1623,37 @@ describe("timeouts", () => {
 			}),
 		).rejects.toBeInstanceOf(GitCommandError);
 		expect(fetched).toBe(false);
+	});
+});
+
+describe("best-effort removal (shutil.rmtree ignore_errors=True)", () => {
+	test("removeWorkspace keeps going past an EACCES and never throws", async () => {
+		const mgr = new SandboxManager(tmpPath());
+		const wsRoot = mgr.workspaceRoot("o/r", 51);
+		fs.mkdirSync(path.join(wsRoot, "a"), { recursive: true });
+		fs.mkdirSync(path.join(wsRoot, "b"), { recursive: true });
+		const stuck = path.join(wsRoot, "a", "stuck");
+		const other = path.join(wsRoot, "b", "other");
+		fs.writeFileSync(stuck, "x");
+		fs.writeFileSync(other, "x");
+		const eacces = (p: string) =>
+			Object.assign(new Error(`EACCES: permission denied, '${p}'`), { code: "EACCES", errno: -13 });
+		const realUnlink = fs.promises.unlink;
+		const rm = spyOn(fs.promises, "rm").mockImplementation(async p => {
+			throw eacces(String(p));
+		});
+		const unlink = spyOn(fs.promises, "unlink").mockImplementation(async p =>
+			String(p) === stuck ? Promise.reject(eacces(String(p))) : realUnlink(p),
+		);
+		try {
+			await mgr.removeWorkspace({ repo: "o/r", number: 51 });
+		} finally {
+			rm.mockRestore();
+			unlink.mockRestore();
+		}
+		expect(fs.existsSync(stuck)).toBe(true);
+		expect(fs.existsSync(other)).toBe(false);
+		expect(fs.existsSync(path.join(wsRoot, "b"))).toBe(false);
 	});
 });
 
@@ -1510,6 +1700,28 @@ describe("workspace cache reclamation", () => {
 		}
 		expect(trash(wsRoot)).toEqual([]);
 		expect(await mgr.reclaimWorkspaceCaches({ repo: "octo/widget", number: 7 })).toBe(false);
+	});
+
+	test("reclaims a symlinked node_modules without following it", async () => {
+		const tmp = tmpPath();
+		const mgr = new SandboxManager(path.join(tmp, "workspaces"));
+		const wsRoot = mgr.workspaceRoot("octo/widget", 8);
+		const store = path.join(tmp, "store");
+		fs.mkdirSync(path.join(store, "left-pad"), { recursive: true });
+		fs.writeFileSync(path.join(store, "left-pad", "index.js"), "x");
+		fs.mkdirSync(path.join(wsRoot, "repo", "packages", "tui"), { recursive: true });
+		fs.symlinkSync(store, path.join(wsRoot, "repo", "node_modules"));
+		// A symlinked directory is listed but never descended into (os.walk followlinks=False).
+		const linkedTarget = path.join(tmp, "linked-target");
+		fs.mkdirSync(path.join(linkedTarget, "node_modules"), { recursive: true });
+		fs.symlinkSync(linkedTarget, path.join(wsRoot, "repo", "linked"));
+		expect(findNodeModules(path.join(wsRoot, "repo"))).toEqual([path.join(wsRoot, "repo", "node_modules")]);
+		expect(await mgr.reclaimWorkspaceCaches({ repo: "octo/widget", number: 8 })).toBe(true);
+		expect(fs.existsSync(path.join(wsRoot, "repo", "node_modules"))).toBe(false);
+		expect(fs.lstatSync(path.join(wsRoot, "repo", "linked")).isSymbolicLink()).toBe(true);
+		expect(fs.readFileSync(path.join(store, "left-pad", "index.js"), "utf-8")).toBe("x");
+		expect(fs.existsSync(path.join(linkedTarget, "node_modules"))).toBe(true);
+		expect(trash(wsRoot)).toEqual([]);
 	});
 
 	test("a missing workspace is a noop", async () => {
