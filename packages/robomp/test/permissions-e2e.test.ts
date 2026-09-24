@@ -216,170 +216,189 @@ function prepareSharedCargoCache(tmp: string): string {
 	return cargoTarget;
 }
 
+/**
+ * Python's `_require_linux_root_toolchain()` calls `pytest.skip(reason)`, so an
+ * unmet prerequisite reports each case as SKIPPED. Resolve it at load time so
+ * bun registers the cases as skipped rather than letting them pass vacuously.
+ */
+const toolchainSkip = enabled ? toolchainSkipReason() : null;
+if (toolchainSkip !== null) console.warn(`skipping slot permission e2e: ${toolchainSkip}`);
+const slotTest = test.skipIf(toolchainSkip !== null);
+
 describe.skipIf(!enabled)("slot permission e2e", () => {
-	test("slot workspace runs bun, biome, cargo and git after root re-entry", async () => {
-		const skip = toolchainSkipReason();
-		if (skip) return void console.warn(skip);
-		const tmp = slotTmpPath();
-		const upstream = upstreamRepo(tmp);
-		const db = makeDb();
-		const cargoTarget = prepareSharedCargoCache(tmp);
-		const workspaces = path.join(tmp, "workspaces");
+	slotTest(
+		"slot workspace runs bun, biome, cargo and git after root re-entry",
+		async () => {
+			const tmp = slotTmpPath();
+			const upstream = upstreamRepo(tmp);
+			const db = makeDb();
+			const cargoTarget = prepareSharedCargoCache(tmp);
+			const workspaces = path.join(tmp, "workspaces");
 
-		const first = await ensureWorkspace(workspaces, upstream, { number: 101, slotUid: SLOT_ONE });
-		const staleBunCache = path.join(first.root, ".omp-xdg", "cache", "bun-install", "root-owned-stale");
-		fs.mkdirSync(staleBunCache, { recursive: true });
-		const staleMarker = path.join(staleBunCache, "marker.txt");
-		fs.writeFileSync(staleMarker, "root-owned\n");
-		fs.chmodSync(staleBunCache, 0o700);
-		fs.chmodSync(staleMarker, 0o600);
+			const first = await ensureWorkspace(workspaces, upstream, { number: 101, slotUid: SLOT_ONE });
+			const staleBunCache = path.join(first.root, ".omp-xdg", "cache", "bun-install", "root-owned-stale");
+			fs.mkdirSync(staleBunCache, { recursive: true });
+			const staleMarker = path.join(staleBunCache, "marker.txt");
+			fs.writeFileSync(staleMarker, "root-owned\n");
+			fs.chmodSync(staleBunCache, 0o700);
+			fs.chmodSync(staleMarker, 0o600);
 
-		const workspace = await ensureWorkspace(workspaces, upstream, {
-			number: 101,
-			slotUid: SLOT_ONE,
-			existingBranch: first.branch,
-		});
-		const bindings = bindingsFor(db, workspace, upstream, SLOT_ONE);
+			const workspace = await ensureWorkspace(workspaces, upstream, {
+				number: 101,
+				slotUid: SLOT_ONE,
+				existingBranch: first.branch,
+			});
+			const bindings = bindingsFor(db, workspace, upstream, SLOT_ONE);
 
-		await runOk(bindings, ["bun", "install", "--no-progress"], 300);
-		await runOk(bindings, ["bun", "run", "check:ts"], 180);
-		await runOk(bindings, ["cargo", "check", "--workspace"], 600);
-		await runPrePublishBunCheck(bindings, {}, { toolName: "gh_push_branch", stage: "push" });
+			await runOk(bindings, ["bun", "install", "--no-progress"], 300);
+			await runOk(bindings, ["bun", "run", "check:ts"], 180);
+			await runOk(bindings, ["cargo", "check", "--workspace"], 600);
+			await runPrePublishBunCheck(bindings, {}, { toolName: "gh_push_branch", stage: "push" });
 
-		const bunCache = repoCommandEnv(bindings).BUN_INSTALL_CACHE_DIR!;
-		expect(fs.statSync(bunCache).isDirectory()).toBe(true);
-		expect(fs.statSync(bunCache).uid).toBe(SLOT_ONE);
-		expect(fs.statSync(staleMarker).uid).toBe(SLOT_ONE);
-		expect(fs.statSync(path.join(cargoTarget, "debug")).isDirectory()).toBe(true);
-		expect(fs.statSync(path.join(cargoTarget, "debug")).gid).toBe(SHARED_OMP_GID);
+			const bunCache = repoCommandEnv(bindings).BUN_INSTALL_CACHE_DIR!;
+			expect(fs.statSync(bunCache).isDirectory()).toBe(true);
+			expect(fs.statSync(bunCache).uid).toBe(SLOT_ONE);
+			expect(fs.statSync(staleMarker).uid).toBe(SLOT_ONE);
+			expect(fs.statSync(path.join(cargoTarget, "debug")).isDirectory()).toBe(true);
+			expect(fs.statSync(path.join(cargoTarget, "debug")).gid).toBe(SHARED_OMP_GID);
 
-		await writeAsSlot(bindings, "src/slot-generated.ts", "export const generatedBySlot = true;\n");
-		await runOk(bindings, ["git", "add", "src/slot-generated.ts", "Cargo.lock", "bun.lock"]);
-		await runOk(bindings, ["git", "commit", "-m", "slot generated file"]);
-		const status = await runOk(bindings, ["git", "status", "--porcelain", "--untracked-files=normal"]);
-		expect(status.stdout.trim()).toBe("");
-	}, 1_200_000);
+			await writeAsSlot(bindings, "src/slot-generated.ts", "export const generatedBySlot = true;\n");
+			await runOk(bindings, ["git", "add", "src/slot-generated.ts", "Cargo.lock", "bun.lock"]);
+			await runOk(bindings, ["git", "commit", "-m", "slot generated file"]);
+			const status = await runOk(bindings, ["git", "status", "--porcelain", "--untracked-files=normal"]);
+			expect(status.stdout.trim()).toBe("");
+		},
+		1_200_000,
+	);
 
-	test("git pool metadata survives root push and retry slot", async () => {
-		const skip = toolchainSkipReason();
-		if (skip) return void console.warn(skip);
-		const tmp = slotTmpPath();
-		const upstream = upstreamRepo(tmp);
-		const db = makeDb();
-		const workspaces = path.join(tmp, "workspaces");
+	slotTest(
+		"git pool metadata survives root push and retry slot",
+		async () => {
+			const tmp = slotTmpPath();
+			const upstream = upstreamRepo(tmp);
+			const db = makeDb();
+			const workspaces = path.join(tmp, "workspaces");
 
-		const first = await ensureWorkspace(workspaces, upstream, { number: 102, slotUid: SLOT_ONE });
-		const firstBindings = bindingsFor(db, first, upstream, SLOT_ONE);
-		await writeAsSlot(firstBindings, "src/first-slot.ts", "export const firstSlot = 1;\n");
-		await runOk(firstBindings, ["git", "add", "src/first-slot.ts"]);
-		await runOk(firstBindings, ["git", "commit", "-m", "first slot commit"]);
+			const first = await ensureWorkspace(workspaces, upstream, { number: 102, slotUid: SLOT_ONE });
+			const firstBindings = bindingsFor(db, first, upstream, SLOT_ONE);
+			await writeAsSlot(firstBindings, "src/first-slot.ts", "export const firstSlot = 1;\n");
+			await runOk(firstBindings, ["git", "add", "src/first-slot.ts"]);
+			await runOk(firstBindings, ["git", "commit", "-m", "first slot commit"]);
 
-		const firstHead = await guardedPushBranch(firstBindings, {}, "gh_push_branch", first.branch);
-		expect(git(["--git-dir", upstream, "rev-parse", first.branch], tmp).trim()).toBe(firstHead);
+			const firstHead = await guardedPushBranch(firstBindings, {}, "gh_push_branch", first.branch);
+			expect(git(["--git-dir", upstream, "rev-parse", first.branch], tmp).trim()).toBe(firstHead);
 
-		const retry = await ensureWorkspace(workspaces, upstream, {
-			number: 102,
-			slotUid: SLOT_TWO,
-			existingBranch: first.branch,
-		});
-		const retryBindings = bindingsFor(db, retry, upstream, SLOT_TWO);
-		await runOk(retryBindings, ["git", "fsck", "--no-progress"], 180);
-		await writeAsSlot(retryBindings, "src/retry-slot.ts", "export const retrySlot = 2;\n");
-		await runOk(retryBindings, ["git", "add", "src/retry-slot.ts"]);
-		await runOk(retryBindings, ["git", "commit", "-m", "retry slot commit"]);
+			const retry = await ensureWorkspace(workspaces, upstream, {
+				number: 102,
+				slotUid: SLOT_TWO,
+				existingBranch: first.branch,
+			});
+			const retryBindings = bindingsFor(db, retry, upstream, SLOT_TWO);
+			await runOk(retryBindings, ["git", "fsck", "--no-progress"], 180);
+			await writeAsSlot(retryBindings, "src/retry-slot.ts", "export const retrySlot = 2;\n");
+			await runOk(retryBindings, ["git", "add", "src/retry-slot.ts"]);
+			await runOk(retryBindings, ["git", "commit", "-m", "retry slot commit"]);
 
-		const retryHead = await guardedPushBranch(retryBindings, {}, "gh_push_branch", retry.branch);
-		expect(git(["--git-dir", upstream, "rev-parse", retry.branch], tmp).trim()).toBe(retryHead);
-		expect(retryHead).not.toBe(firstHead);
-	}, 600_000);
+			const retryHead = await guardedPushBranch(retryBindings, {}, "gh_push_branch", retry.branch);
+			expect(git(["--git-dir", upstream, "rev-parse", retry.branch], tmp).trim()).toBe(retryHead);
+			expect(retryHead).not.toBe(firstHead);
+		},
+		600_000,
+	);
 
-	test("natives cache shares artifacts across slot workspaces", async () => {
-		// Capture under slot 1, populate under slot 2: setgid `omp` inheritance,
-		// hardlinked `.node`, copied companions, and rebuild/rewrite isolation.
-		const skip = toolchainSkipReason();
-		if (skip) return void console.warn(skip);
-		const tmp = slotTmpPath();
-		const upstream = upstreamRepo(tmp);
-		const db = makeDb();
-		const workspaces = path.join(tmp, "workspaces");
-		const cacheRoot = path.join(tmp, "cache", "pi-natives");
-		fs.mkdirSync(cacheRoot, { recursive: true });
-		fs.chownSync(cacheRoot, 0, SHARED_OMP_GID);
-		chmodFull(cacheRoot, 0o2770);
-		const nativesCache = new NativesCache(cacheRoot);
-		const manager = new SandboxManager(workspaces, { transport: new LocalGitTransport(null), nativesCache });
+	slotTest(
+		"natives cache shares artifacts across slot workspaces",
+		async () => {
+			// Capture under slot 1, populate under slot 2: setgid `omp` inheritance,
+			// hardlinked `.node`, copied companions, and rebuild/rewrite isolation.
+			const tmp = slotTmpPath();
+			const upstream = upstreamRepo(tmp);
+			const db = makeDb();
+			const workspaces = path.join(tmp, "workspaces");
+			const cacheRoot = path.join(tmp, "cache", "pi-natives");
+			fs.mkdirSync(cacheRoot, { recursive: true });
+			fs.chownSync(cacheRoot, 0, SHARED_OMP_GID);
+			chmodFull(cacheRoot, 0o2770);
+			const nativesCache = new NativesCache(cacheRoot);
+			const manager = new SandboxManager(workspaces, { transport: new LocalGitTransport(null), nativesCache });
 
-		// --- Workspace 1: stage built artifacts and capture them. ---
-		const ws1 = await manager.ensureWorkspace({
-			repo: REPO,
-			number: 301,
-			title: "natives cache producer",
-			cloneUrl: upstream,
-			defaultBranch: "main",
-			authorName: AUTHOR_NAME,
-			authorEmail: AUTHOR_EMAIL,
-			slotUid: SLOT_ONE,
-		});
-		const bindings1 = bindingsFor(db, ws1, upstream, SLOT_ONE);
-		await writeAsSlot(bindings1, "packages/natives/native/pi_natives.linux-arm64.node", "ELFx-original");
-		await writeAsSlot(bindings1, "packages/natives/native/index.d.ts", "export const X: number;\n");
-		await writeAsSlot(bindings1, "packages/natives/native/index.js", "export const X = 1;\n");
-		await writeAsSlot(bindings1, "packages/natives/native/embedded-addon.js", "export const embeddedAddon = null;\n");
+			// --- Workspace 1: stage built artifacts and capture them. ---
+			const ws1 = await manager.ensureWorkspace({
+				repo: REPO,
+				number: 301,
+				title: "natives cache producer",
+				cloneUrl: upstream,
+				defaultBranch: "main",
+				authorName: AUTHOR_NAME,
+				authorEmail: AUTHOR_EMAIL,
+				slotUid: SLOT_ONE,
+			});
+			const bindings1 = bindingsFor(db, ws1, upstream, SLOT_ONE);
+			await writeAsSlot(bindings1, "packages/natives/native/pi_natives.linux-arm64.node", "ELFx-original");
+			await writeAsSlot(bindings1, "packages/natives/native/index.d.ts", "export const X: number;\n");
+			await writeAsSlot(bindings1, "packages/natives/native/index.js", "export const X = 1;\n");
+			await writeAsSlot(
+				bindings1,
+				"packages/natives/native/embedded-addon.js",
+				"export const embeddedAddon = null;\n",
+			);
 
-		const key = await nativesComputeKey(ws1.repo_dir, "linux-arm64");
-		const nativeDir1 = path.join(ws1.repo_dir, "packages", "natives", "native");
-		const stored = await nativesCache.capture(REPO, key, nativeDir1, { sourceWorkspace: ws1.workspace_key });
-		expect(stored).not.toBeNull();
-		const cachedNode = path.join(stored!, "pi_natives.linux-arm64.node");
-		const cachedCompanion = path.join(stored!, "index.d.ts");
-		expect(fs.statSync(cachedNode).gid).toBe(SHARED_OMP_GID);
-		expect(fs.statSync(cachedCompanion).gid).toBe(SHARED_OMP_GID);
+			const key = await nativesComputeKey(ws1.repo_dir, "linux-arm64");
+			const nativeDir1 = path.join(ws1.repo_dir, "packages", "natives", "native");
+			const stored = await nativesCache.capture(REPO, key, nativeDir1, { sourceWorkspace: ws1.workspace_key });
+			expect(stored).not.toBeNull();
+			const cachedNode = path.join(stored!, "pi_natives.linux-arm64.node");
+			const cachedCompanion = path.join(stored!, "index.d.ts");
+			expect(fs.statSync(cachedNode).gid).toBe(SHARED_OMP_GID);
+			expect(fs.statSync(cachedCompanion).gid).toBe(SHARED_OMP_GID);
 
-		// --- Workspace 2: a different slot UID gets auto-populated on ensure. ---
-		const ws2 = await manager.ensureWorkspace({
-			repo: REPO,
-			number: 302,
-			title: "natives cache consumer",
-			cloneUrl: upstream,
-			defaultBranch: "main",
-			authorName: AUTHOR_NAME,
-			authorEmail: AUTHOR_EMAIL,
-			slotUid: SLOT_TWO,
-		});
-		const bindings2 = bindingsFor(db, ws2, upstream, SLOT_TWO);
-		const nativeDir2 = path.join(ws2.repo_dir, "packages", "natives", "native");
-		const ws2Node = path.join(nativeDir2, "pi_natives.linux-arm64.node");
-		const ws2Companion = path.join(nativeDir2, "index.d.ts");
-		expect(fs.existsSync(ws2Node)).toBe(true);
-		expect(fs.existsSync(ws2Companion)).toBe(true);
-		// The .node is hardlinked (same inode); the companion is copied.
-		expect(fs.statSync(ws2Node).ino).toBe(fs.statSync(cachedNode).ino);
-		expect(fs.statSync(cachedNode).nlink).toBeGreaterThanOrEqual(2);
-		expect(fs.statSync(ws2Companion).ino).not.toBe(fs.statSync(cachedCompanion).ino);
+			// --- Workspace 2: a different slot UID gets auto-populated on ensure. ---
+			const ws2 = await manager.ensureWorkspace({
+				repo: REPO,
+				number: 302,
+				title: "natives cache consumer",
+				cloneUrl: upstream,
+				defaultBranch: "main",
+				authorName: AUTHOR_NAME,
+				authorEmail: AUTHOR_EMAIL,
+				slotUid: SLOT_TWO,
+			});
+			const bindings2 = bindingsFor(db, ws2, upstream, SLOT_TWO);
+			const nativeDir2 = path.join(ws2.repo_dir, "packages", "natives", "native");
+			const ws2Node = path.join(nativeDir2, "pi_natives.linux-arm64.node");
+			const ws2Companion = path.join(nativeDir2, "index.d.ts");
+			expect(fs.existsSync(ws2Node)).toBe(true);
+			expect(fs.existsSync(ws2Companion)).toBe(true);
+			// The .node is hardlinked (same inode); the companion is copied.
+			expect(fs.statSync(ws2Node).ino).toBe(fs.statSync(cachedNode).ino);
+			expect(fs.statSync(cachedNode).nlink).toBeGreaterThanOrEqual(2);
+			expect(fs.statSync(ws2Companion).ino).not.toBe(fs.statSync(cachedCompanion).ino);
 
-		// Slot 2 can read the populated artifacts.
-		await runOk(bindings2, ["test", "-r", "packages/natives/native/pi_natives.linux-arm64.node"]);
-		await runOk(bindings2, ["test", "-r", "packages/natives/native/index.d.ts"]);
+			// Slot 2 can read the populated artifacts.
+			await runOk(bindings2, ["test", "-r", "packages/natives/native/pi_natives.linux-arm64.node"]);
+			await runOk(bindings2, ["test", "-r", "packages/natives/native/index.d.ts"]);
 
-		// Rebuild simulation: napi's installBinary does temp + rename.
-		await runOk(bindings2, [
-			"python3",
-			"-c",
-			"import os, sys; dest = sys.argv[1]; tmp = dest + '.tmp.rebuild'; " +
-				"open(tmp, 'wb').write(b'REBUILT'); os.rename(tmp, dest)",
-			"packages/natives/native/pi_natives.linux-arm64.node",
-		]);
-		expect(fs.readFileSync(ws2Node, "utf-8")).toBe("REBUILT");
-		expect(fs.readFileSync(cachedNode, "utf-8")).toBe("ELFx-original");
-		expect(fs.statSync(ws2Node).ino).not.toBe(fs.statSync(cachedNode).ino);
+			// Rebuild simulation: napi's installBinary does temp + rename.
+			await runOk(bindings2, [
+				"python3",
+				"-c",
+				"import os, sys; dest = sys.argv[1]; tmp = dest + '.tmp.rebuild'; " +
+					"open(tmp, 'wb').write(b'REBUILT'); os.rename(tmp, dest)",
+				"packages/natives/native/pi_natives.linux-arm64.node",
+			]);
+			expect(fs.readFileSync(ws2Node, "utf-8")).toBe("REBUILT");
+			expect(fs.readFileSync(cachedNode, "utf-8")).toBe("ELFx-original");
+			expect(fs.statSync(ws2Node).ino).not.toBe(fs.statSync(cachedNode).ino);
 
-		// Companion rewrite (open-truncate-write) must not touch the cache copy.
-		await writeAsSlot(bindings2, "packages/natives/native/index.d.ts", "// regenerated by gen-enums\n");
-		expect(fs.readFileSync(ws2Companion, "utf-8")).toBe("// regenerated by gen-enums\n");
-		expect(fs.readFileSync(cachedCompanion, "utf-8")).toBe("export const X: number;\n");
+			// Companion rewrite (open-truncate-write) must not touch the cache copy.
+			await writeAsSlot(bindings2, "packages/natives/native/index.d.ts", "// regenerated by gen-enums\n");
+			expect(fs.readFileSync(ws2Companion, "utf-8")).toBe("// regenerated by gen-enums\n");
+			expect(fs.readFileSync(cachedCompanion, "utf-8")).toBe("export const X: number;\n");
 
-		// Recapture is idempotent under the flock.
-		const again = await nativesCache.capture(REPO, key, nativeDir2, { sourceWorkspace: ws2.workspace_key });
-		expect(again).toBe(stored);
-	}, 600_000);
+			// Recapture is idempotent under the flock.
+			const again = await nativesCache.capture(REPO, key, nativeDir2, { sourceWorkspace: ws2.workspace_key });
+			expect(again).toBe(stored);
+		},
+		600_000,
+	);
 });

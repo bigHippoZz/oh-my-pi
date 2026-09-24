@@ -24,6 +24,7 @@ import {
 	type ToolBindingsInit,
 } from "../src/host-tools";
 import { type HttpTransport, jsonResponse, mockTransport } from "../src/http";
+import { pySplitlines } from "../src/pycompat";
 import { type GitTransport, LocalGitTransport, SandboxManager, Workspace } from "../src/sandbox";
 import * as subprocess from "../src/subprocess";
 import type { CompletedProcess, RunOptions } from "../src/subprocess";
@@ -1370,6 +1371,18 @@ test("diffAnchorableLines treats in-hunk ++/-- content as diff lines", () => {
 	expect(sorted(left)).toEqual([1, 2, 3]);
 });
 
+test("diffAnchorableLines splits patch lines like Python str.splitlines", () => {
+	// `\f`, `\v` and U+2028 are line boundaries for Python's `patch.splitlines()`,
+	// so each fragment counts as its own diff line. Expected sets were produced by
+	// the Python `_diff_anchorable_lines` on the same input.
+	let [right, left] = hostTools.diffAnchorableLines("@@ -1,2 +1,3 @@\n ctx\fmore\n+add\n ctx2\n");
+	expect(sorted(right)).toEqual([1, 2, 3, 4]);
+	expect(sorted(left)).toEqual([1, 2, 3]);
+	[right, left] = hostTools.diffAnchorableLines("@@ -5,3 +5,3 @@\n a\v-b\n+c\u2028+d\n e\n");
+	expect(sorted(right)).toEqual([5, 6, 7, 8]);
+	expect(sorted(left)).toEqual([5, 6, 7]);
+});
+
 test("review tools reject outside review mode", async () => {
 	const db = makeDb();
 	const bindings = bindingsFor(db, tmpPath(), fail500);
@@ -1429,13 +1442,19 @@ for (const classification of ["enhancement", "proposal"]) {
 		const base = bindingsFor(db, tmpPath(), fail500);
 		db.setIssueClassification(base.issueKey, classification);
 		const bindings = replaceBindings(base, { implAuthorized: true });
+		// Python: pytest.raises(RuntimeError) — the repo-command error escapes
+		// unwrapped, not as a tool (RpcCommandError) refusal.
+		const reached = new Error("authorized non-auto issue reached gh_push_branch repo command");
 		fakeRepoCommands(async (_b, cmd) => {
 			calls.push([...cmd]);
-			throw new Error("authorized non-auto issue reached gh_push_branch repo command");
+			throw reached;
 		});
-		await expect(run(bindings, "gh_push_branch", {})).rejects.toThrow(
-			"authorized non-auto issue reached gh_push_branch repo command",
+		const err = await run(bindings, "gh_push_branch", {}).then(
+			() => null,
+			(e: unknown) => e,
 		);
+		expect(err).toBe(reached);
+		expect(err).not.toBeInstanceOf(HostToolCommandError);
 		expect(calls.length).toBeGreaterThan(0);
 	});
 }
@@ -1459,13 +1478,19 @@ test("impl gate allows later authorized event to reach repo commands", async () 
 	const bindings = bindingsFor(db, tmpPath(), fail500);
 	db.setIssueClassification(bindings.issueKey, "enhancement");
 	recordAuthorizingEvent(db, bindings, "auth-event");
+	// Python: pytest.raises(RuntimeError) — the repo-command error escapes
+	// unwrapped, not as a tool (RpcCommandError) refusal.
+	const reached = new Error("later authorized event reached gh_push_branch repo command");
 	fakeRepoCommands(async (_b, cmd) => {
 		calls.push([...cmd]);
-		throw new Error("later authorized event reached gh_push_branch repo command");
+		throw reached;
 	});
-	await expect(run(bindings, "gh_push_branch", {})).rejects.toThrow(
-		"later authorized event reached gh_push_branch repo command",
+	const err = await run(bindings, "gh_push_branch", {}).then(
+		() => null,
+		(e: unknown) => e,
 	);
+	expect(err).toBe(reached);
+	expect(err).not.toBeInstanceOf(HostToolCommandError);
 	expect(calls.length).toBeGreaterThan(0);
 });
 
@@ -1718,13 +1743,13 @@ function commitFiles(ws: Workspace, files: string[], message: string, identity: 
 }
 
 function farmRefs(bare: string): string[] {
-	return gitOrThrow(["-C", bare, "for-each-ref", "--format=%(refname)"])
-		.split("\n")
-		.filter(r => r.startsWith("refs/heads/farm/"));
+	return pySplitlines(gitOrThrow(["-C", bare, "for-each-ref", "--format=%(refname)"])).filter(r =>
+		r.startsWith("refs/heads/farm/"),
+	);
 }
 
 function refNames(bare: string): string[] {
-	return gitOrThrow(["-C", bare, "for-each-ref", "--format=%(refname)"]).split("\n").filter(Boolean);
+	return pySplitlines(gitOrThrow(["-C", bare, "for-each-ref", "--format=%(refname)"]));
 }
 
 /** Install a fake `bun` at the front of PATH for this test. */
@@ -1972,7 +1997,7 @@ test("gh_push_branch runs fix and check before pushing", async () => {
 	expect(fs.readFileSync(fixCalls, "utf-8")).toBe("called");
 	expect(fs.readFileSync(checkCalls, "utf-8")).toBe("called");
 	// The formatter diff was amended into HEAD — no standalone `style:` commit.
-	const lines = gitOrThrow(["-C", ws.repo_dir, "log", "--format=%an <%ae> %s", "-n", "2"]).trim().split("\n");
+	const lines = pySplitlines(gitOrThrow(["-C", ws.repo_dir, "log", "--format=%an <%ae> %s", "-n", "2"]).trim());
 	expect(lines[0]).toBe("robomp-bot <robomp-bot@example.invalid> feat: follow-up");
 	expect(lines[1]).toBe("robomp-bot <robomp-bot@example.invalid> init");
 	expect(fs.readFileSync(path.join(ws.repo_dir, "src.txt"), "utf-8")).toBe("formatted\n");
@@ -2082,7 +2107,7 @@ test("gh_open_pr runs fix then check and amends formatter diff", async () => {
 
 	expect(fs.readFileSync(fixCalls, "utf-8")).toBe("called");
 	expect(fs.readFileSync(checkCalls, "utf-8")).toBe("called");
-	const lines = gitOrThrow(["-C", ws.repo_dir, "log", "--format=%an|%ae|%s", "-2"]).trim().split("\n");
+	const lines = pySplitlines(gitOrThrow(["-C", ws.repo_dir, "log", "--format=%an|%ae|%s", "-2"]).trim());
 	expect(lines[0]).toBe("robomp-bot|robomp-bot@example.invalid|feat: initial change");
 	expect(lines[1]!.endsWith("|init")).toBe(true);
 	expect(gitOrThrow(["-C", ws.repo_dir, "show", "HEAD:src.txt"])).toBe("formatted\n");
@@ -2517,5 +2542,141 @@ test("release status and job log are scoped to expected sha", async () => {
 	expect(status.sha).toBe(expectedSha);
 	expect(status.runs[0].failed_jobs[0].failed_steps).toEqual(["bun check"]);
 	expect(seen[0]).toEqual(["/repos/octo/widget/actions/runs", `head_sha=${expectedSha}&per_page=100`]);
-	expect(logTail.split("\n")).toEqual(logLines.slice(-1000));
+	expect(pySplitlines(logTail)).toEqual(logLines.slice(-1000));
+});
+
+/** Release-session bindings: no issue context, audit rows keyed by the release. */
+function releaseContextBindings(db: Database, transport: HttpTransport): ToolBindings {
+	const workspace = stubWorkspace(tmpPath());
+	workspace.branch = "main";
+	workspace.issue_number = "release";
+	db.upsertRelease({
+		repo: "octo/widget",
+		tag: "v1.2.3",
+		version: "1.2.3",
+		current_sha: "a".repeat(40),
+		session_dir: workspace.session_dir,
+	});
+	return new ToolBindings({
+		db,
+		github: new GitHubClient("token", { transport }),
+		gitTransport: new LocalGitTransport(null),
+		repo: stubRepo(),
+		issue: null,
+		workspace,
+		authorName: "robomp-bot",
+		authorEmail: "robomp-bot@example.invalid",
+		settings: makeSettings(),
+		release: {
+			repo: "octo/widget",
+			tag: "v1.2.3",
+			version: "1.2.3",
+			key: "octo/widget#v1.2.3",
+			expected_sha: "a".repeat(40),
+			default_branch: "main",
+		},
+	});
+}
+
+function searchItem(number: number, isPr: boolean): Record<string, unknown> {
+	return {
+		number,
+		title: `item ${number}`,
+		state: "closed",
+		state_reason: "completed",
+		user: { login: "bot" },
+		labels: [],
+		comments: 0,
+		updated_at: "2026-06-02T00:00:00Z",
+		created_at: "2026-06-02T00:00:00Z",
+		html_url: `https://example/${number}`,
+		...(isPr ? { pull_request: { url: `https://example/pull/${number}` } } : {}),
+	};
+}
+
+test("gh_search_issues without issue context only needs it to self-filter an issue row", async () => {
+	// Python resolves `_require_issue` inside the per-row self-filter, and PR rows
+	// short-circuit it: a release session can search as long as no issue row needs
+	// filtering, and an issue row surfaces the missing-context refusal.
+	const db = makeDb();
+	let items: Record<string, unknown>[] = [searchItem(31, true)];
+	const transport = mockTransport(() => jsonResponse(200, { total_count: items.length, items }));
+	const bindings = releaseContextBindings(db, transport);
+	const result = await run(bindings, "gh_search_issues", { query: "resize crash" });
+	expect(result).toContain("#31 (PR, closed (completed))");
+	items = [];
+	expect(await run(bindings, "gh_search_issues", { query: "resize crash" })).toBe(
+		"No issues or PRs in octo/widget match 'resize crash'.",
+	);
+	items = [searchItem(30, false)];
+	const msg = await expectCommandError(run(bindings, "gh_search_issues", { query: "resize crash" }));
+	expect(msg).toBe("this tool requires issue context");
+});
+
+test("search_commits fails the tool when the origin probe times out", async () => {
+	// Python's rev-parse probe has no TimeoutExpired handler: the timeout escapes
+	// the tool (unwrapped, unaudited) instead of silently falling back to HEAD.
+	const db = makeDb();
+	const bindings = bindingsFor(db, tmpPath(), fail500);
+	const calls: string[][] = [];
+	fakeRepoCommands(async (_b, cmd, options) => {
+		calls.push([...cmd]);
+		expect(options?.timeout).toBe(30);
+		return { ...completed(cmd, 124, "", ""), timedOut: true };
+	});
+	const err = await run(bindings, "search_commits", { query: "colon selector" }).then(
+		() => null,
+		(e: unknown) => e,
+	);
+	expect(err).toBeInstanceOf(hostTools.TimeoutExpiredError);
+	expect(err).not.toBeInstanceOf(HostToolCommandError);
+	expect((err as Error).message).toBe(
+		"Command '['git', 'rev-parse', '--verify', '--quiet', 'origin/main']' timed out after 30.0 seconds",
+	);
+	expect(calls).toEqual([["git", "rev-parse", "--verify", "--quiet", "origin/main"]]);
+	expect(toolCallRows(db, "search_commits")).toEqual([]);
+});
+
+test("integer args accept booleans where Python's isinstance(x, int) does", async () => {
+	// `bool` subclasses `int` in Python: `number=True` targets #1, `exit_code=True`
+	// renders as `True`, and a `True` review line stages as line 1. Only
+	// release_job_log excludes bools explicitly.
+	const db = makeDb();
+	let url = "";
+	const transport = mockTransport(request => {
+		url = request.url;
+		return comment201(7);
+	});
+	const bindings = bindingsFor(db, tmpPath(), transport);
+	await run(bindings, "gh_post_comment", { body: "hi", number: true });
+	expect(url.endsWith("/repos/octo/widget/issues/1/comments")).toBe(true);
+
+	expect(await run(bindings, "repro_record", { ...REPRO_ARGS, exit_code: true })).toBe("recorded");
+	const files = fs.readdirSync(bindings.workspace.repro_dir);
+	expect(files).toHaveLength(1);
+	expect(fs.readFileSync(path.join(bindings.workspace.repro_dir, files[0]!), "utf-8")).toContain(
+		"- exit_code: True\n",
+	);
+	const reproRows = toolCallRows(db, "repro_record");
+	expect(JSON.parse(reproRows[reproRows.length - 1]!.args_json).exit_code).toBe(true);
+
+	const review = reviewBindings(makeDb(), tmpPath(), fail500);
+	expect(await run(review, "pr_review_comment", { path: "src/app.py", line: true, body: "nit" })).toContain(
+		"staged_count=1",
+	);
+	expect(review.db.listStagedReviewComments(review.issueKey).map(c => c.line)).toEqual([1]);
+	// `False <= 0`, so a False start_line is refused like 0.
+	const msg = await expectCommandError(
+		run(review, "pr_review_comment", { path: "src/app.py", line: 2, start_line: false, body: "nit" }),
+	);
+	expect(msg).toBe("pr_review_comment 'start_line' must be a positive integer when provided.");
+});
+
+test("release_job_log rejects booleans as job ids", async () => {
+	const db = makeDb();
+	const bindings = releaseContextBindings(db, fail500);
+	const msg = await expectCommandError(run(bindings, "release_job_log", { job_id: true }));
+	expect(msg).toBe("release_job_log requires an integer 'job_id'.");
+	const tailMsg = await expectCommandError(run(bindings, "release_job_log", { job_id: 20, tail_lines: null }));
+	expect(tailMsg).toBe("release_job_log 'tail_lines' must be an integer.");
 });

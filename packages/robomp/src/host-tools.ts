@@ -28,7 +28,18 @@ import {
 import { parseSearchQuery } from "./issue-index";
 import { getLogger } from "./logging";
 import * as persona from "./persona";
-import { pyJsonDumps, pyRepr, pyTupleRepr } from "./pycompat";
+import {
+	pyInt,
+	pyIsInt,
+	pyIterOrEmpty,
+	pyJsonDumps,
+	pyRepr,
+	pySplitlines,
+	pySplitWhitespace,
+	pyStr,
+	pyTruthy,
+	pyTupleRepr,
+} from "./pycompat";
 import {
 	type GitTransport,
 	prepareSlotRuntimeEnv,
@@ -190,6 +201,25 @@ export class CommandNotFoundError extends Error {
 	constructor(readonly command: string) {
 		super(`command not found: ${command}`);
 		this.name = "CommandNotFoundError";
+	}
+}
+
+/** Python float `str()` for the whole-second timeouts used here (`30` → `30.0`). */
+function pyFloatStr(value: number): string {
+	return Number.isInteger(value) ? `${value}.0` : String(value);
+}
+
+/**
+ * Python `subprocess.TimeoutExpired` for an uncaught command timeout; the
+ * message is `str(exc)` byte-for-byte so the agent sees Python's tool error.
+ */
+export class TimeoutExpiredError extends Error {
+	constructor(
+		readonly cmd: readonly string[],
+		readonly timeout: number,
+	) {
+		super(`Command '${pyRepr([...cmd])}' timed out after ${pyFloatStr(timeout)} seconds`);
+		this.name = "TimeoutExpired";
 	}
 }
 
@@ -389,10 +419,6 @@ function procErr(proc: CompletedProcess): string {
 	return (proc.stderr || proc.stdout).trim();
 }
 
-function splitLines(text: string): string[] {
-	return text.split(/\r\n|\r|\n/).filter((line, i, all) => i < all.length - 1 || line !== "");
-}
-
 /**
  * Bootstrap `node_modules` so the agent can resolve workspace packages.
  *
@@ -424,7 +450,7 @@ export async function ensureWorkspaceDependencies(bindings: ToolBindings): Promi
 	if (proc.timedOut) {
 		log.warning("bun_install bootstrap failed", {
 			issue: bindings.issueKey,
-			err: `Command ${pyRepr([...BUN_INSTALL_COMMAND])} timed out after ${BUN_INSTALL_TIMEOUT_SECONDS} seconds`,
+			err: new TimeoutExpiredError(BUN_INSTALL_COMMAND, BUN_INSTALL_TIMEOUT_SECONDS).message,
 		});
 		return;
 	}
@@ -489,7 +515,7 @@ async function runPrePublishBunFix(bindings: ToolBindings, args: Args, opts: Gat
 	// isn't swept into the formatter amend by the `git add -A` below.
 	const preStatus = await runRepoCommand(bindings, ["git", "status", "--porcelain", "--untracked-files=normal"]);
 	if (preStatus.stdout.trim()) {
-		const dirty = splitLines(preStatus.stdout.trim()).join("\n  ");
+		const dirty = pySplitlines(preStatus.stdout.trim()).join("\n  ");
 		refuseWith(
 			bindings,
 			toolName,
@@ -753,7 +779,8 @@ function param(tool: string, name: string): string {
 	return persona.hostToolParameterDescription(tool, name);
 }
 
-function isInt(value: unknown): value is number {
+/** `isinstance(value, int) and not isinstance(value, bool)` — only `release_job_log` excludes bools. */
+function isStrictInt(value: unknown): value is number {
 	return typeof value === "number" && Number.isInteger(value);
 }
 
@@ -778,7 +805,7 @@ function buildPostComment(bindings: ToolBindings): RpcClientCustomTool {
 			const body = args.body;
 			if (!nonEmptyString(body)) raiseCommand("gh_post_comment requires a non-empty 'body'.");
 			let targetNumber = bindings.defaultCommentNumber;
-			if (isInt(args.number)) targetNumber = args.number;
+			if (pyIsInt(args.number)) targetNumber = pyInt(args.number);
 			// If this comment answers the originating question issue, append the
 			// 👎-to-keep-open suffix so the auto-close scheduler has a reaction surface.
 			const scheduleClose = shouldScheduleAutoclose(bindings, targetNumber);
@@ -853,7 +880,7 @@ async function repairCommitMessageEscapes(bindings: ToolBindings, args: Args, to
 	const base = bindings.repo.default_branch;
 	const revList = await runRepoCommand(bindings, ["git", "rev-list", "--reverse", `origin/${base}..HEAD`]);
 	if (revList.returncode !== 0) return;
-	const shas = revList.stdout.split(/\s+/).filter(Boolean);
+	const shas = pySplitWhitespace(revList.stdout);
 	if (shas.length === 0) return;
 	const messages = new Map<string, string>();
 	const repaired: string[] = [];
@@ -896,7 +923,7 @@ async function repairCommitMessageEscapes(bindings: ToolBindings, args: Args, to
 			string,
 			string,
 		];
-		const parentsOld = parentsRaw.split(/\s+/).filter(Boolean);
+		const parentsOld = pySplitWhitespace(parentsRaw);
 		const parentsNew = parentsOld.map(p => rewritten.get(p) ?? p);
 		if (!needsFix.has(sha) && parentsNew.every((p, i) => p === parentsOld[i])) {
 			rewritten.set(sha, sha);
@@ -938,7 +965,7 @@ async function repairCommitMessageEscapes(bindings: ToolBindings, args: Args, to
 
 function identityOffenders(stdout: string, bindings: ToolBindings): string[] {
 	const offending: string[] = [];
-	for (const line of splitLines(stdout.trim())) {
+	for (const line of pySplitlines(stdout.trim())) {
 		const parts = line.split("\t");
 		if (parts.length < 3) continue;
 		const [sha, email, name] = parts as [string, string, string];
@@ -1025,7 +1052,7 @@ export async function guardedPushBranch(
 	// review delta but not in the commit history.
 	const status = await runRepoCommand(bindings, ["git", "status", "--porcelain", "--untracked-files=normal"]);
 	if (status.stdout.trim()) {
-		const dirty = splitLines(status.stdout.trim()).join("\n  ");
+		const dirty = pySplitlines(status.stdout.trim()).join("\n  ");
 		refuseWith(
 			bindings,
 			toolName,
@@ -1120,9 +1147,9 @@ function buildReleaseJobLog(bindings: ToolBindings): RpcClientCustomTool {
 		async args => {
 			const release = requireRelease(bindings);
 			const jobId = args.job_id;
-			if (!isInt(jobId)) raiseCommand("release_job_log requires an integer 'job_id'.");
-			const tailRaw = args.tail_lines ?? 200;
-			if (!isInt(tailRaw)) raiseCommand("release_job_log 'tail_lines' must be an integer.");
+			if (!isStrictInt(jobId)) raiseCommand("release_job_log requires an integer 'job_id'.");
+			const tailRaw = args.tail_lines === undefined ? 200 : args.tail_lines;
+			if (!isStrictInt(tailRaw)) raiseCommand("release_job_log 'tail_lines' must be an integer.");
 			const tailLines = Math.max(1, Math.min(tailRaw, 1000));
 			let logTail: string;
 			try {
@@ -1137,7 +1164,7 @@ function buildReleaseJobLog(bindings: ToolBindings): RpcClientCustomTool {
 				);
 			}
 			audit(bindings, "release_job_log", args, {
-				result: { job_id: jobId, tail_lines: tailLines, returned_lines: splitLines(logTail).length },
+				result: { job_id: jobId, tail_lines: tailLines, returned_lines: pySplitlines(logTail).length },
 			});
 			return logTail;
 		},
@@ -1171,7 +1198,7 @@ function buildReleaseRetag(bindings: ToolBindings): RpcClientCustomTool {
 				);
 			}
 
-			const skipChecks = Boolean(args.skip_checks ?? false);
+			const skipChecks = pyTruthy(args.skip_checks);
 			await runPrePublishBunFix(bindings, args, { toolName: tool, stage: "retag", skipChecks });
 			await runPrePublishBunCheck(bindings, args, { toolName: tool, stage: "retag", skipChecks });
 
@@ -1182,7 +1209,7 @@ function buildReleaseRetag(bindings: ToolBindings): RpcClientCustomTool {
 				);
 			}
 			if (status.stdout.trim()) {
-				const dirty = splitLines(status.stdout.trim()).join("\n  ");
+				const dirty = pySplitlines(status.stdout.trim()).join("\n  ");
 				refuse(
 					`refusing to retag: working tree is dirty.\n  ${dirty}\n` +
 						"Commit (or `git stash`) every change before retagging.",
@@ -1300,8 +1327,8 @@ function buildPushBranch(bindings: ToolBindings): RpcClientCustomTool {
 				refuseWith(bindings, "gh_push_branch", args, "refusing to push: PR review worktrees are read-only.");
 			}
 			enforceImplAuthorization(bindings, "gh_push_branch", args, "push branch");
-			const branch = String(args.branch || bindings.workspace.branch);
-			const skip = Boolean(args.skip_checks ?? false);
+			const branch = pyTruthy(args.branch) ? pyStr(args.branch) : bindings.workspace.branch;
+			const skip = pyTruthy(args.skip_checks);
 			// Formatter + check before bytes leave the workstation. The suite is
 			// gated at `gh_open_pr`, not here: a push is not yet a PR.
 			await runPrePublishBunFix(bindings, args, { toolName: "gh_push_branch", stage: "push", skipChecks: skip });
@@ -1356,7 +1383,7 @@ function buildOpenPr(bindings: ToolBindings): RpcClientCustomTool {
 						"Verification section per the template.",
 				);
 			}
-			const skip = Boolean(args.skip_checks ?? false);
+			const skip = pyTruthy(args.skip_checks);
 			const gate = { toolName: "gh_open_pr", stage: "open PR", skipChecks: skip };
 			await runPrePublishBunFix(bindings, args, gate);
 			await runPrePublishBunCheck(bindings, args, gate);
@@ -1365,7 +1392,7 @@ function buildOpenPr(bindings: ToolBindings): RpcClientCustomTool {
 			await runPrePublishBunTest(bindings, args, gate);
 			// Make sure the branch is pushed (idempotent) using the same preflight.
 			await guardedPushBranch(bindings, args, "gh_open_pr", bindings.workspace.branch);
-			const base = args.base || bindings.repo.default_branch;
+			const base = pyTruthy(args.base) ? args.base : bindings.repo.default_branch;
 			const wasNeedsInfo = issueNeedsInfo(bindings);
 			let pr: PullRequestInfo;
 			try {
@@ -1375,7 +1402,7 @@ function buildOpenPr(bindings: ToolBindings): RpcClientCustomTool {
 					base: String(base),
 					title,
 					body,
-					draft: Boolean(args.draft ?? false),
+					draft: pyTruthy(args.draft),
 				});
 			} catch (err) {
 				if (!(err instanceof GitHubError)) throw err;
@@ -1413,8 +1440,8 @@ function buildRequestReview(bindings: ToolBindings): RpcClientCustomTool {
 			additionalProperties: false,
 		},
 		async args => {
-			const reviewers = args.reviewers || [];
-			const assignees = args.assignees || [];
+			const reviewers = pyTruthy(args.reviewers) ? args.reviewers : [];
+			const assignees = pyTruthy(args.assignees) ? args.assignees : [];
 			if (!Array.isArray(reviewers) || !Array.isArray(assignees)) {
 				raiseCommand("gh_request_review expects 'reviewers' and 'assignees' to be arrays of logins.");
 			}
@@ -1469,7 +1496,7 @@ function buildReproRecord(bindings: ToolBindings): RpcClientCustomTool {
 			if (!nonEmptyString(title)) raiseCommand("repro_record requires a non-empty 'title'.");
 			if (!nonEmptyString(command)) raiseCommand("repro_record requires a non-empty 'command'.");
 			if (typeof output !== "string") raiseCommand("repro_record requires 'output' (may be empty string).");
-			if (!isInt(exitCode)) raiseCommand("repro_record requires an integer 'exit_code'.");
+			if (!pyIsInt(exitCode)) raiseCommand("repro_record requires an integer 'exit_code'.");
 			const reproDir = bindings.workspace.repro_dir;
 			fs.mkdirSync(reproDir, { recursive: true });
 			const slugChars = Array.from(title.toLowerCase(), c => (isAlnum(c) ? c : "-")).join("");
@@ -1478,7 +1505,7 @@ function buildReproRecord(bindings: ToolBindings): RpcClientCustomTool {
 			const target = path.join(reproDir, `${ts}-${slug}.md`);
 			await Bun.write(
 				target,
-				`# ${title}\n\n- exit_code: ${exitCode}\n- command:\n\n\`\`\`\n${command}\n\`\`\`\n\n## Output\n\n\`\`\`\n${output}\n\`\`\`\n`,
+				`# ${title}\n\n- exit_code: ${pyStr(exitCode)}\n- command:\n\n\`\`\`\n${command}\n\`\`\`\n\n## Output\n\n\`\`\`\n${output}\n\`\`\`\n`,
 			);
 			// Single-ownership invariant: workspace files belong to the active
 			// slot. Hand the root-written file over so the agent can edit it.
@@ -1657,9 +1684,12 @@ function buildSearchIssues(bindings: ToolBindings): RpcClientCustomTool {
 				);
 			}
 			const limitRaw = args.limit;
-			const limit = isInt(limitRaw) ? Math.max(1, Math.min(limitRaw, 20)) : 10;
+			const limit = pyIsInt(limitRaw) ? Math.max(1, Math.min(pyInt(limitRaw), 20)) : 10;
 			const repo = bindings.repo.full_name;
-			const selfNumber = requireIssue(bindings).number;
+			// Python resolves the inbound issue lazily inside the self-filter, so
+			// a missing issue context only fails once there is a row to filter.
+			const isSelf = (entry: { is_pull_request: boolean; number: number }): boolean =>
+				!entry.is_pull_request && entry.number === requireIssue(bindings).number;
 
 			let rows: SearchRow[];
 			let source: string;
@@ -1675,7 +1705,7 @@ function buildSearchIssues(bindings: ToolBindings): RpcClientCustomTool {
 						author: parsed.author,
 						limit: limit + 1, // headroom for the self-filter below
 					})
-					.filter(e => e.is_pull_request || e.number !== selfNumber)
+					.filter(e => !isSelf(e))
 					.slice(0, limit);
 				rows = entries.map(e => {
 					let state: string;
@@ -1696,7 +1726,7 @@ function buildSearchIssues(bindings: ToolBindings): RpcClientCustomTool {
 					raiseCommand(`GitHub search failed: ${err.status} ${err.detail}`);
 				}
 				rows = found
-					.filter(s => s.is_pull_request || s.number !== selfNumber)
+					.filter(s => !isSelf(s))
 					.map(s => [
 						s.is_pull_request,
 						s.number,
@@ -1720,6 +1750,7 @@ function buildSearchIssues(bindings: ToolBindings): RpcClientCustomTool {
 
 // ---------- search_commits ----------
 const COMMIT_SEARCH_TIMEOUT_SECONDS = 120;
+const PROBE_TIMEOUT_SECONDS = 30;
 
 /**
  * Local `git log` search over the default branch's history. `message` greps
@@ -1746,18 +1777,19 @@ function buildSearchCommits(bindings: ToolBindings): RpcClientCustomTool {
 			if (!nonEmptyString(queryRaw))
 				refuseWith(bindings, tool, args, "search_commits requires a non-empty 'query'.");
 			const query = queryRaw.trim();
-			const mode = args.mode || "message";
+			const mode = pyTruthy(args.mode) ? args.mode : "message";
 			if (mode !== "message" && mode !== "patch") {
 				refuseWith(bindings, tool, args, "search_commits 'mode' must be 'message' or 'patch'.");
 			}
 			const limitRaw = args.limit;
-			const limit = isInt(limitRaw) ? Math.max(1, Math.min(limitRaw, 30)) : 10;
-			const paths = (Array.isArray(args.paths) ? args.paths : []).filter(nonEmptyString);
+			const limit = pyIsInt(limitRaw) ? Math.max(1, Math.min(pyInt(limitRaw), 30)) : 10;
+			const paths = pyIterOrEmpty(args.paths).filter(nonEmptyString);
 
 			let rev = `origin/${bindings.repo.default_branch}`;
-			const probe = await runRepoCommand(bindings, ["git", "rev-parse", "--verify", "--quiet", rev], {
-				timeout: 30,
-			});
+			const probeCmd = ["git", "rev-parse", "--verify", "--quiet", rev];
+			const probe = await runRepoCommand(bindings, probeCmd, { timeout: PROBE_TIMEOUT_SECONDS });
+			// Python's probe has no TimeoutExpired handler: a hung rev-parse fails the tool.
+			if (probe.timedOut) throw new TimeoutExpiredError(probeCmd, PROBE_TIMEOUT_SECONDS);
 			if (probe.returncode !== 0) rev = "HEAD";
 			const cmd = ["git", "log", rev, "-n", String(limit), "--date=short", "--pretty=format:%h %ad %an — %s"];
 			if (mode === "message") cmd.push(`--grep=${query}`, "--regexp-ignore-case");
@@ -1780,7 +1812,7 @@ function buildSearchCommits(bindings: ToolBindings): RpcClientCustomTool {
 				audit(bindings, tool, args, { result: { matches: 0 } });
 				return `No commits on ${rev} match ${pyRepr(query)} (mode=${mode}).`;
 			}
-			const matches = splitLines(out);
+			const matches = pySplitlines(out);
 			audit(bindings, tool, args, { result: { matches: matches.length } });
 			const header = `# ${matches.length} commit(s) on ${rev} matching ${pyRepr(query)} (mode=${mode})`;
 			return [header, ...matches].join("\n");
@@ -1925,7 +1957,7 @@ function buildClassifyPr(bindings: ToolBindings): RpcClientCustomTool {
 				refuseWith(bindings, tool, args, "classify_pr requires a one-sentence 'rationale'.");
 
 			const labels: string[] = ["triaged", rank, prType];
-			for (const area of Array.isArray(args.area) ? args.area : []) {
+			for (const area of pyIterOrEmpty(args.area)) {
 				if (oneOf(FUNCTIONAL, area)) labels.push(area);
 			}
 			const provider = args.provider;
@@ -1983,25 +2015,26 @@ function buildPrReviewComment(bindings: ToolBindings): RpcClientCustomTool {
 			const refuse: (msg: string) => never = msg => refuseWith(bindings, tool, args, msg);
 			const { path: filePath, line, body } = args;
 			if (!nonEmptyString(filePath)) refuse("pr_review_comment requires a non-empty 'path'.");
-			if (!isInt(line) || line <= 0) refuse("pr_review_comment requires a positive integer 'line'.");
+			if (!pyIsInt(line) || pyInt(line) <= 0) refuse("pr_review_comment requires a positive integer 'line'.");
 			if (!nonEmptyString(body)) refuse("pr_review_comment requires a non-empty 'body'.");
-			const side = String(args.side || "RIGHT");
+			const side = pyTruthy(args.side) ? pyStr(args.side) : "RIGHT";
 			if (side !== "RIGHT" && side !== "LEFT") refuse("pr_review_comment 'side' must be RIGHT or LEFT.");
 			const startLine = args.start_line ?? null;
-			if (startLine !== null && (!isInt(startLine) || startLine <= 0)) {
+			if (startLine !== null && (!pyIsInt(startLine) || pyInt(startLine) <= 0)) {
 				refuse("pr_review_comment 'start_line' must be a positive integer when provided.");
 			}
 			const startSideRaw = args.start_side ?? null;
-			const startSide = startSideRaw !== null ? String(startSideRaw) : null;
+			const startSide = startSideRaw !== null ? pyStr(startSideRaw) : null;
 			if (startSide !== null && startSide !== "RIGHT" && startSide !== "LEFT") {
 				refuse("pr_review_comment 'start_side' must be RIGHT or LEFT when provided.");
 			}
 			const staged = bindings.db.stageReviewComment({
 				issue_key: bindings.issueKey,
 				path: (filePath as string).trim(),
-				line: line as number,
+				// sqlite stores Python's `True`/`False` as 1/0.
+				line: pyInt(line as number | boolean),
 				side,
-				start_line: startLine as number | null,
+				start_line: startLine === null ? null : pyInt(startLine as number | boolean),
 				start_side: startSide,
 				body: (body as string).trim(),
 			});
@@ -2024,7 +2057,7 @@ export function diffAnchorableLines(patch: string): [Set<number>, Set<number>] {
 	const left = new Set<number>();
 	let newLine: number | null = null;
 	let oldLine: number | null = null;
-	for (const raw of splitLines(patch)) {
+	for (const raw of pySplitlines(patch)) {
 		const m = DIFF_HUNK_RE.exec(raw);
 		if (m) {
 			oldLine = Number(m[1]);
@@ -2248,7 +2281,7 @@ function buildSetIssueLabels(bindings: ToolBindings): RpcClientCustomTool {
 			const cleaned = labels.filter(nonEmptyString).map(l => l.trim());
 			if (cleaned.length === 0) raiseCommand("set_issue_labels requires at least one non-empty label.");
 			let targetNumber = requireIssue(bindings).number;
-			if (isInt(args.number)) targetNumber = args.number;
+			if (pyIsInt(args.number)) targetNumber = pyInt(args.number);
 			let applied: string[];
 			try {
 				applied = await bindings.github.addIssueLabels(bindings.repo.full_name, targetNumber, cleaned);
@@ -2337,7 +2370,7 @@ function buildClassifyIssue(bindings: ToolBindings): RpcClientCustomTool {
 
 			const labels: string[] = [primary];
 			if (primary === "bug" && typeof priority === "string") labels.push(priority);
-			for (const fn of Array.isArray(args.functional) ? args.functional : []) {
+			for (const fn of pyIterOrEmpty(args.functional)) {
 				// Unknown functional tags are dropped silently.
 				if (oneOf(FUNCTIONAL, fn)) labels.push(fn);
 			}
