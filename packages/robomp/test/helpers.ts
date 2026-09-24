@@ -25,7 +25,35 @@ export function onCleanup(fn: () => void): void {
 export function tmpPath(): string {
 	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "robomp-test-"));
 	onCleanup(() => fs.rmSync(dir, { recursive: true, force: true }));
+	openForSlotTraversal(dir);
 	return dir;
+}
+
+/**
+ * Grant traverse (`o+x`, not `o+r`) on `dir` and its ancestors so slot
+ * subprocesses (setpriv to uid 2001+) can reach the workspace when the suite
+ * runs as root on Linux.
+ */
+function openForSlotTraversal(dir: string): void {
+	if (process.platform !== "linux" || process.geteuid?.() !== 0) return;
+	let cursor = path.resolve(dir);
+	while (cursor !== path.dirname(cursor)) {
+		let st: fs.Stats;
+		try {
+			st = fs.statSync(cursor);
+		} catch {
+			break;
+		}
+		if (!st.isDirectory()) break;
+		if (!(st.mode & 0o001)) {
+			try {
+				fs.chmodSync(cursor, (st.mode & 0o7777) | 0o001);
+			} catch {
+				break;
+			}
+		}
+		cursor = path.dirname(cursor);
+	}
 }
 
 export function baselineEnv(tmp: string): Record<string, string> {
@@ -78,4 +106,29 @@ export function makeDb(tmp = tmpPath()): Database {
 	const db = new Database(path.join(tmp, "test.sqlite"));
 	onCleanup(() => db.close());
 	return db;
+}
+
+const GIT_TEST_IDENTITY = {
+	GIT_AUTHOR_NAME: "release-test",
+	GIT_AUTHOR_EMAIL: "release-test@example.invalid",
+	GIT_COMMITTER_NAME: "release-test",
+	GIT_COMMITTER_EMAIL: "release-test@example.invalid",
+};
+
+/** Run git synchronously in tests; throws on failure unless `check` is false. */
+export function gitSync(
+	cwd: string,
+	args: string[],
+	options: { check?: boolean; env?: Record<string, string> } = {},
+): string {
+	const proc = Bun.spawnSync(["git", ...args], {
+		cwd,
+		env: { ...process.env, ...GIT_TEST_IDENTITY, ...options.env },
+		stdout: "pipe",
+		stderr: "pipe",
+	});
+	if ((options.check ?? true) && proc.exitCode !== 0) {
+		throw new Error(`git ${args.join(" ")} failed: ${proc.stderr.toString()}`);
+	}
+	return proc.stdout.toString().trim();
 }
