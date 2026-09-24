@@ -16,7 +16,8 @@ import { GitHubClient, GitHubError, isMapping, type Json } from "../github-clien
 import { App, HttpError, json, type Query, readBodyCapped, type RouteContext } from "../http-app";
 import { getLogger } from "../logging";
 import { HEADER_SIGNATURE, HEADER_TIMESTAMP, verify } from "../proxy-hmac";
-import { pyRepr, safeDirectoryEnv } from "../sandbox";
+import { pyRepr } from "../pycompat";
+import { safeDirectoryEnv } from "../sandbox";
 import { runProcess, slotIdentity } from "../subprocess";
 
 const log = getLogger("robomp.proxy.server");

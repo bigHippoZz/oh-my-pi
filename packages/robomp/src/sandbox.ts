@@ -29,6 +29,7 @@ import {
 } from "./git-ops";
 import { getLogger } from "./logging";
 import { chmodFull } from "./posix";
+import { pyRepr } from "./pycompat";
 import { type CacheHit, computeKey as nativesComputeKey, type NativesCache } from "./natives-cache";
 import {
 	type CompletedProcess,
@@ -112,14 +113,6 @@ export function validateBranchSlug(value: unknown): string {
 		);
 	}
 	return value;
-}
-
-/** Python-ish `repr()` for error messages. */
-export function pyRepr(value: unknown): string {
-	if (typeof value === "string") return `'${value.replaceAll("\\", "\\\\").replaceAll("'", "\\'")}'`;
-	if (value === null || value === undefined) return "None";
-	if (typeof value === "boolean") return value ? "True" : "False";
-	return typeof value === "object" ? JSON.stringify(value) : String(value);
 }
 
 /**

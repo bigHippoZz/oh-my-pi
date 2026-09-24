@@ -15,6 +15,7 @@ import * as path from "node:path";
 import { acquireFileLock } from "@oh-my-pi/pi-utils";
 import { getLogger } from "./logging";
 import { processEnv, runProcess } from "./subprocess";
+import { chmodFull } from "./posix";
 
 const log = getLogger("robomp.natives_cache");
 
@@ -135,7 +136,7 @@ export function atomicCopy(src: string, dst: string): void {
 		fs.copyFileSync(src, tmp);
 		const st = fs.statSync(src);
 		fs.utimesSync(tmp, st.atime, st.mtime);
-		fs.chmodSync(tmp, st.mode & 0o7777);
+		chmodFull(tmp, st.mode & 0o7777);
 		fs.renameSync(tmp, dst);
 	} finally {
 		fs.rmSync(tmp, { force: true });
