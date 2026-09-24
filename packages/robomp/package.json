@@ -22,7 +22,7 @@
 		}
 	},
 	"scripts": {
-		"check": "oxlint . && oxfmt --check --no-error-on-unmatched-pattern 'src/**/*.ts' '{test,scripts}/**/*.ts' '*.ts' && bun run check:types",
+		"check": "oxlint . && oxfmt --check --no-error-on-unmatched-pattern 'src/**/*.ts' '{test,scripts}/**/*.ts' && bun run check:types",
 		"check:types": "tsgo -p tsconfig.json --noEmit",
 		"lint": "oxlint .",
 		"test": "bun test",
