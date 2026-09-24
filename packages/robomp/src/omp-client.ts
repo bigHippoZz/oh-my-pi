@@ -11,14 +11,24 @@
  * - Host tools reached through an `xd://` device report the transport tool
  *   (`write`) in `tool_execution_end`; events are renamed to the host tool
  *   that actually ran, keyed by the dispatch's `toolCallId`.
+ * - `set_todos` and extension UI replies are not on the `RpcClient` surface:
+ *   the adapter owns the spawned process, so it tees the agent's stdout to
+ *   observe those frames and writes its own frames to stdin. Responses carry
+ *   `robomp_`-prefixed ids, which `RpcClient` ignores as uncorrelated.
  */
 import * as fs from "node:fs";
 import type { AgentEvent, AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { RpcAgentProcess, RpcClientCustomTool } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-client";
 import { RpcClient } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-client";
-import type { RpcExtensionUIRequest } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-types";
+import { RpcFrameDecoder } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-frame";
+import type {
+	RpcCommand,
+	RpcExtensionUIRequest,
+	RpcExtensionUIResponse,
+	RpcResponse,
+} from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-types";
 import type { TodoPhase } from "@oh-my-pi/pi-tui/tools/todo";
-import { ptree } from "@oh-my-pi/pi-utils";
+import { isRecord, ptree, readJsonl } from "@oh-my-pi/pi-utils";
 import { type ProcessIdentity, SHARED_OMP_GID, wrapWithIdentity } from "./subprocess";
 
 export type { TodoPhase };
@@ -84,6 +94,19 @@ export class RpcProcessExitError extends Error {
 
 /** Passive extension UI methods (notifications/status) need no response. */
 const PASSIVE_UI_METHODS = new Set(["notify", "setStatus", "setWidget", "setTitle", "set_editor_text", "open_url"]);
+
+/** Command frames the adapter sends itself, bypassing `RpcClient`. */
+type OwnCommand = Extract<RpcCommand, { type: "set_todos" }>;
+
+/** Prefix for adapter-owned request ids (never collides with `RpcClient`'s `req_N`). */
+const OWN_ID_PREFIX = "robomp_";
+
+/** Headless answer to an interactive extension UI request; `null` for passive methods. */
+export function headlessUiResponse(request: RpcExtensionUIRequest): RpcExtensionUIResponse | null {
+	if (request.method === "cancel" || PASSIVE_UI_METHODS.has(request.method)) return null;
+	if (request.method === "confirm") return { type: "extension_ui_response", id: request.id, confirmed: false };
+	return { type: "extension_ui_response", id: request.id, cancelled: true };
+}
 
 /** Resolve a group name via /etc/group (Python `grp.getgrnam`). */
 export function groupId(name: string): number | null {
@@ -161,6 +184,10 @@ export class RpcOmpClient implements OmpClient {
 	readonly #options: OmpClientOptions;
 	readonly #client: RpcClient;
 	readonly #dispatchNames = new Map<string, string>();
+	readonly #ownPending = new Map<string, PromiseWithResolvers<RpcResponse>>();
+	#ownRequestId = 0;
+	#process: RpcAgentProcess | null = null;
+	#headless = false;
 	#closed: { promise: Promise<never>; reject: (error: Error) => void; error: Error | null };
 	#started = false;
 
@@ -214,7 +241,79 @@ export class RpcOmpClient implements OmpClient {
 			code => this.markClosed(new RpcProcessExitError(`omp exited with code ${code}`)),
 			() => this.markClosed(new RpcProcessExitError("omp exited")),
 		);
-		return child;
+		const [clientStdout, tapStdout] = child.stdout.tee();
+		const proc: RpcAgentProcess = {
+			stdin: child.stdin,
+			stdout: clientStdout,
+			peekStderr: () => child.peekStderr(),
+			kill: (signal, graceMs) => child.kill(signal, graceMs),
+			exited: child.exited,
+		};
+		this.#process = proc;
+		void this.#observe(tapStdout, proc);
+		return proc;
+	}
+
+	/** Watch the agent's output for adapter-owned responses and extension UI requests. */
+	async #observe(stdout: ReadableStream<Uint8Array>, proc: RpcAgentProcess): Promise<void> {
+		let decoder = new RpcFrameDecoder();
+		try {
+			for await (const line of readJsonl<unknown>(stdout)) {
+				let frame: object | undefined;
+				try {
+					frame = decoder.push(line);
+				} catch {
+					// Malformed chunking is `RpcClient`'s to report; just resync.
+					decoder = new RpcFrameDecoder();
+					continue;
+				}
+				if (!isRecord(frame)) continue;
+				if (frame.type === "response" && typeof frame.id === "string") {
+					const pending = this.#ownPending.get(frame.id);
+					if (pending) {
+						this.#ownPending.delete(frame.id);
+						pending.resolve(frame as unknown as RpcResponse);
+					}
+					continue;
+				}
+				if (this.#headless && frame.type === "extension_ui_request" && typeof frame.id === "string") {
+					const response = headlessUiResponse(frame as unknown as RpcExtensionUIRequest);
+					if (response !== null) this.#write(proc, response);
+				}
+			}
+		} catch {
+			// Output failures surface through `RpcClient` and the exit watcher.
+		} finally {
+			if (this.#process === proc) this.#process = null;
+			const error = new RpcProcessExitError("omp output stream ended");
+			for (const pending of this.#ownPending.values()) pending.reject(error);
+			this.#ownPending.clear();
+		}
+	}
+
+	#write(proc: RpcAgentProcess, frame: OwnCommand | RpcExtensionUIResponse): void {
+		try {
+			proc.stdin.write(`${JSON.stringify(frame)}\n`);
+			const stdin = proc.stdin as { flush?: () => unknown };
+			const flushed = stdin.flush?.();
+			if (flushed instanceof Promise) flushed.catch(() => {});
+		} catch {
+			// The agent is gone; the pending request is rejected by the output tap.
+		}
+	}
+
+	async #command(command: Omit<OwnCommand, "id">): Promise<RpcResponse> {
+		const proc = this.#process;
+		if (proc === null) throw new RpcProcessExitError("omp is not running");
+		const id = `${OWN_ID_PREFIX}${++this.#ownRequestId}`;
+		const pending = Promise.withResolvers<RpcResponse>();
+		this.#ownPending.set(id, pending);
+		this.#write(proc, { ...command, id } as OwnCommand);
+		try {
+			return await this.#request(pending.promise);
+		} finally {
+			this.#ownPending.delete(id);
+		}
 	}
 
 	async start(): Promise<void> {
@@ -239,14 +338,7 @@ export class RpcOmpClient implements OmpClient {
 	}
 
 	installHeadlessUi(): void {
-		this.#client.onExtensionUiRequest((request: RpcExtensionUIRequest) => {
-			if (request.method === "cancel" || PASSIVE_UI_METHODS.has(request.method)) return;
-			if (request.method === "confirm") {
-				this.#client.sendExtensionUiResponse({ type: "extension_ui_response", id: request.id, confirmed: false });
-				return;
-			}
-			this.#client.sendExtensionUiResponse({ type: "extension_ui_response", id: request.id, cancelled: true });
-		});
+		this.#headless = true;
 	}
 
 	onToolExecutionEnd(listener: (event: ToolExecutionEnd) => void): void {
@@ -275,7 +367,8 @@ export class RpcOmpClient implements OmpClient {
 	}
 
 	async setTodos(phases: TodoPhase[]): Promise<void> {
-		await this.#request(this.#client.setTodos(phases));
+		const response = await this.#command({ type: "set_todos", phases });
+		if (!response.success) throw new Error(`set_todos failed: ${response.error}`);
 	}
 
 	async getTodos(): Promise<TodoPhase[]> {

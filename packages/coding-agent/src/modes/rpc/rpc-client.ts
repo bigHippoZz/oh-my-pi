@@ -13,7 +13,6 @@ import type { FileSink } from "bun";
 import type { BashResult } from "../../exec/bash-executor";
 import type { AgentSessionEvent, SessionStats } from "../../session/agent-session";
 import type { SessionEntry, SessionTreeNode } from "../../session/session-entries";
-import type { TodoPhase } from "@oh-my-pi/pi-tui/tools/todo";
 import { MAX_RPC_FRAME_BYTES, MAX_RPC_REASSEMBLED_BYTES, RpcFrameDecoder, type RpcProtocolVersion } from "./rpc-frame";
 import {
 	RPC_MESSAGES_PAGE_BUSY_ERROR,
@@ -1014,32 +1013,6 @@ export class RpcClient {
 		}));
 		const response = await this.#send({ type: "set_host_tools", tools: definitions });
 		return this.#getData<{ toolNames: string[] }>(response).toolNames;
-	}
-
-	/**
-	 * Replace the session's todo phases.
-	 */
-	async setTodos(phases: TodoPhase[]): Promise<TodoPhase[]> {
-		const response = await this.#send({ type: "set_todos", phases });
-		return this.#getData<{ todoPhases: TodoPhase[] }>(response).todoPhases;
-	}
-
-	/**
-	 * Subscribe to extension UI requests (confirm/select/input/notify/...).
-	 * Interactive requests must be answered via {@link sendExtensionUiResponse}.
-	 */
-	onExtensionUiRequest(listener: (request: RpcExtensionUIRequest) => void): () => void {
-		this.#extensionUiListeners.add(listener);
-		return () => {
-			this.#extensionUiListeners.delete(listener);
-		};
-	}
-
-	/**
-	 * Answer an extension UI request.
-	 */
-	sendExtensionUiResponse(response: RpcExtensionUIResponse): void {
-		this.#writeFrame(response);
 	}
 
 	// =========================================================================
