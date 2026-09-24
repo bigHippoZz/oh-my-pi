@@ -127,7 +127,6 @@ export function classifyNextStep(primary: string): string {
 export interface PromptWorkspace {
 	branch: string;
 	repo_dir: string;
-	[key: string]: unknown;
 }
 
 type RepoLike = Pick<RepoInfo, "full_name" | "default_branch"> & Partial<RepoInfo>;

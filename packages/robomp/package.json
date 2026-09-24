@@ -31,8 +31,10 @@
 		"serve": "bun src/cli.ts serve"
 	},
 	"dependencies": {
+		"@oh-my-pi/pi-agent-core": "catalog:",
 		"@oh-my-pi/pi-coding-agent": "catalog:",
 		"@oh-my-pi/pi-natives": "catalog:",
+		"@oh-my-pi/pi-tui": "catalog:",
 		"@oh-my-pi/pi-utils": "catalog:"
 	},
 	"devDependencies": {
