@@ -16,7 +16,14 @@ import type { GitHubBackend } from "../src/github-backend";
 import * as hostTools from "../src/host-tools";
 import { AbortController, ToolBindings } from "../src/host-tools";
 import type { NativesCache } from "../src/natives-cache";
-import type { OmpClient, OmpClientOptions, PromptTurn, TodoPhase, ToolExecutionEnd } from "../src/omp-client";
+import {
+	type OmpClient,
+	type OmpClientOptions,
+	type PromptTurn,
+	RpcProcessExitError,
+	type TodoPhase,
+	type ToolExecutionEnd,
+} from "../src/omp-client";
 import * as persona from "../src/persona";
 import { LocalGitTransport, Workspace } from "../src/sandbox";
 import * as subprocess from "../src/subprocess";
@@ -336,48 +343,85 @@ test("runRpc passes slot uid as user, slot group and omp extra group", async () 
 	expect(options.extraGroups).toEqual(["omp"]);
 });
 
-interface FakeTimer {
-	interval: number;
-	fn: () => void;
-	started: boolean;
-	cancelled: boolean;
+class FakeTimer implements worker.Timer {
+	daemon = false;
+	started = false;
+	cancelled = false;
+	constructor(
+		readonly interval: number,
+		readonly fn: () => void,
+		readonly fireOnStart = false,
+	) {}
+	start(): void {
+		this.started = true;
+		if (this.fireOnStart) this.fn();
+	}
+	cancel(): void {
+		this.cancelled = true;
+	}
 }
 
 test("runRpc arms hard timeout timer", async () => {
 	const timers: FakeTimer[] = [];
 	track(
-		spyOn(worker.workerDeps, "startTimer").mockImplementation((interval, fn) => {
-			const timer: FakeTimer = { interval, fn, started: true, cancelled: false };
+		spyOn(worker.workerDeps, "createTimer").mockImplementation((interval, fn) => {
+			const timer = new FakeTimer(interval, fn);
 			timers.push(timer);
-			return {
-				cancel: () => {
-					timer.cancelled = true;
-				},
-			};
+			return timer;
 		}),
 	);
 	const settings = makeSettings({ ROBOMP_TASK_TIMEOUT_SECONDS: "3", ROBOMP_TASK_TIMEOUT_HARD_GRACE_SECONDS: "7" });
 	const fixture = makeInputs({ sessionHasJsonl: false, settings });
 	await runRpc(fixture);
 	expect(timers).toHaveLength(1);
-	expect(timers[0]!.interval).toBe(10);
-	expect(timers[0]!.started).toBe(true);
-	expect(timers[0]!.cancelled).toBe(true);
+	const timer = timers[0]!;
+	expect(timer.interval).toBe(10);
+	expect(timer.daemon).toBe(true);
+	expect(timer.started).toBe(true);
+	expect(timer.cancelled).toBe(true);
 });
 
 test("runRpc hard timeout stops client and fails", async () => {
 	track(
-		spyOn(worker.workerDeps, "startTimer").mockImplementation((_interval, fn) => {
-			fn();
-			return { cancel: () => {} };
-		}),
+		spyOn(worker.workerDeps, "createTimer").mockImplementation((interval, fn) => new FakeTimer(interval, fn, true)),
 	);
 	const fixture = makeInputs({ sessionHasJsonl: false });
-	await expect(runRpc(fixture)).rejects.toThrow("hard timeout");
+	const failure = await runRpc(fixture).then(
+		() => null,
+		(err: unknown) => err,
+	);
+	expect(failure).toBeInstanceOf(worker.HardTimeoutError);
+	expect((failure as Error).name).toBe("TimeoutError");
+	expect((failure as Error).message).toContain("hard timeout");
 	expect(fake().stopCalls).toBe(1);
 	// The cancel hook (manual cancel and hard timeout) MUST also mark the
 	// client closed so an in-flight prompt unblocks immediately.
 	expect(fake().markClosedCalls).toHaveLength(1);
+	expect(fake().markClosedCalls[0]).toBeInstanceOf(RpcProcessExitError);
+});
+
+test("runRpc hard timeout that kills the prompt surfaces the prompt's error", async () => {
+	// Python raises `TimeoutError` only when the turn itself returned; a prompt
+	// the hard timeout interrupted propagates its own RPC error unchanged.
+	let fire: (() => void) | null = null;
+	track(
+		spyOn(worker.workerDeps, "createTimer").mockImplementation((interval, fn) => {
+			fire = fn;
+			return new FakeTimer(interval, fn);
+		}),
+	);
+	FakeClient.onPrompt = () => {
+		fire!();
+		throw new RpcProcessExitError("RPC process stopped");
+	};
+	const fixture = makeInputs({ sessionHasJsonl: false });
+	const failure = await runRpc(fixture).then(
+		() => null,
+		(err: unknown) => err,
+	);
+	expect(failure).toBeInstanceOf(RpcProcessExitError);
+	expect((failure as Error).message).toBe("RPC process stopped");
+	expect(fake().stopCalls).toBe(1);
 });
 
 test("runRpc cancel hook stops and marks closed", async () => {
@@ -391,6 +435,7 @@ test("runRpc cancel hook stops and marks closed", async () => {
 	captured[0]!();
 	expect(fake().stopCalls).toBe(preStop + 1);
 	expect(fake().markClosedCalls).toHaveLength(1);
+	expect(fake().markClosedCalls[0]).toBeInstanceOf(RpcProcessExitError);
 	expect(fake().markClosedCalls[0]!.message).toContain("cancelled by operator");
 });
 

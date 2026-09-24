@@ -24,6 +24,7 @@ import {
 	type OmpClientOptions,
 	type PromptTurn,
 	RpcOmpClient,
+	RpcProcessExitError,
 	type TodoPhase,
 } from "./omp-client";
 import * as persona from "./persona";
@@ -116,7 +117,8 @@ export function stageAgentHome(): void {
 				else fs.unlinkSync(dst);
 			}
 			fs.mkdirSync(path.dirname(dst), { recursive: true });
-			fs.cpSync(src, dst, { recursive: true, force: true });
+			// `shutil.copytree(symlinks=False)`: links are copied as their targets.
+			fs.cpSync(src, dst, { recursive: true, force: true, dereference: true });
 		} catch (err) {
 			log.warning(`Failed to stage agent home path ${rel}: ${errMessage(err)}`);
 		}
@@ -143,10 +145,15 @@ export function stageAgentHome(): void {
 		}
 		for (const entry of entries) {
 			const child = path.join(dir, entry.name);
+			// `os.walk` lists a symlink to a directory with the directories
+			// (normalized as one, following the link) but never descends it.
+			const linkedDir = entry.isSymbolicLink() && isDirectory(child);
+			const isDir = entry.isDirectory() || linkedDir;
 			// ~/.omp/run is slot-writable daemon presence state, not template
 			// config; keep it out of the read-only normalization.
-			if (entry.isDirectory() && dir === path.join(agentHome, ".omp") && entry.name === "run") continue;
-			if (entry.isDirectory()) walk(child);
+			if (isDir && dir === path.join(agentHome, ".omp") && entry.name === "run") continue;
+			if (linkedDir) normalize(child, 0o755, "directory");
+			else if (isDir) walk(child);
 			else normalize(child, 0o644, "file");
 		}
 	};
@@ -169,7 +176,8 @@ export function ensureAgentRunDir(): void {
 				const child = path.join(dir, entry.name);
 				if (entry.isDirectory()) {
 					walk(child);
-				} else {
+					// `os.walk` neither descends nor normalizes a linked directory.
+				} else if (!(entry.isSymbolicLink() && isDirectory(child))) {
 					fs.chownSync(child, fs.statSync(child).uid, gid);
 					fs.chmodSync(child, 0o660);
 				}
@@ -255,18 +263,37 @@ async function probeWorkspaceDirtyImpl(workspace: Workspace, slotUid: number | n
 	}
 }
 
-export interface TimerHandle {
+/** Python `threading.Timer`: armed by `start()`, disarmed by `cancel()`. */
+export interface Timer {
+	readonly interval: number;
+	/** Python `Timer.daemon`: a daemon timer never keeps the process alive. */
+	daemon: boolean;
+	start(): void;
 	cancel(): void;
+}
+
+class TimeoutTimer implements Timer {
+	daemon = false;
+	#handle: NodeJS.Timeout | null = null;
+	constructor(
+		readonly interval: number,
+		readonly fn: () => void,
+	) {}
+	start(): void {
+		this.#handle = setTimeout(this.fn, this.interval * 1000);
+		if (this.daemon) this.#handle.unref();
+	}
+	cancel(): void {
+		if (this.#handle !== null) clearTimeout(this.#handle);
+		this.#handle = null;
+	}
 }
 
 /** Test seams (Python module-level monkeypatch targets). */
 export const workerDeps = {
 	createClient: (options: OmpClientOptions): OmpClient => new RpcOmpClient(options),
-	/** Python `threading.Timer(interval, fn).start()`; `interval` in seconds. */
-	startTimer: (interval: number, fn: () => void): TimerHandle => {
-		const handle = setTimeout(fn, interval * 1000);
-		return { cancel: () => clearTimeout(handle) };
-	},
+	/** Python `threading.Timer(interval, fn)`; `interval` in seconds. */
+	createTimer: (interval: number, fn: () => void): Timer => new TimeoutTimer(interval, fn),
 	probeWorkspaceDirty: probeWorkspaceDirtyImpl,
 	nativesComputeKey: (repoDir: string): Promise<string> => nativesComputeKey(repoDir),
 };
@@ -590,9 +617,9 @@ export async function runRpc(
 		// request timeout.
 		const cancelHook = (): void => {
 			try {
-				void client.stop();
+				client.stop().catch(err => log.exception("omp client stop failed", err, { issue: bindings.issueKey }));
 			} finally {
-				client.markClosed(new Error("cancelled by operator"));
+				client.markClosed(new RpcProcessExitError("cancelled by operator"));
 			}
 		};
 		if (bindings.abort !== null) bindings.abort.stop = cancelHook;
@@ -637,7 +664,7 @@ export async function runRpc(
 			log.info("rpc_start", { issue: bindings.issueKey, task: taskKind, branch: bindings.workspace.branch });
 			const hardTimeoutSeconds = taskTimeout(settings, taskKind) + settings.task_timeout_hard_grace_seconds;
 			let hardTimeoutFired = false;
-			const hardTimer = workerDeps.startTimer(hardTimeoutSeconds, () => {
+			const hardTimer = workerDeps.createTimer(hardTimeoutSeconds, () => {
 				hardTimeoutFired = true;
 				log.warning("rpc_hard_timeout", { issue: bindings.issueKey, task: taskKind, timeout: hardTimeoutSeconds });
 				try {
@@ -646,17 +673,18 @@ export async function runRpc(
 					log.exception("rpc hard timeout stop failed", err, { issue: bindings.issueKey, task: taskKind });
 				}
 			});
+			hardTimer.daemon = true;
+			hardTimer.start();
 			let turn: PromptTurn | null;
 			try {
+				// A prompt the hard timeout killed rejects with the client's
+				// closed error, which propagates as-is (Python parity).
 				turn = await driveTurn(client, prompt, { taskKind, inputs, bindings, toolsCalled });
-			} catch (err) {
-				if (hardTimeoutFired) throw new HardTimeoutError("omp task exceeded hard timeout");
-				throw err;
+				if (turn === null) return null;
 			} finally {
 				hardTimer.cancel();
 			}
 			if (hardTimeoutFired) throw new HardTimeoutError("omp task exceeded hard timeout");
-			if (turn === null) return null;
 			if (turn.assistantMessage !== null && turn.assistantMessage.stopReason === "error") {
 				const errorMsg = turn.assistantMessage.errorMessage || "model returned error";
 				throw new Error(`omp agent error (stopReason=error): ${errorMsg}`);

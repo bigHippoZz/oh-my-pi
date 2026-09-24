@@ -194,6 +194,8 @@ test("failure bumps round and runs agent", async () => {
 	const e = env();
 	const calls: number[] = [];
 	fakeRunTask(args => {
+		// Python's fake takes exactly `task_kind` and `inputs` (keyword-only).
+		expect(Object.keys(args).sort()).toEqual(["inputs", "taskKind"]);
 		expect(args.taskKind).toBe("handle_release_ci");
 		calls.push(args.inputs.release!.round);
 		args.inputs.db.setReleaseState(`${REPO}#${TAG}`, "awaiting_ci");

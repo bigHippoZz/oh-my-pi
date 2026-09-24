@@ -9,6 +9,7 @@ import { afterEach, expect, spyOn, test } from "bun:test";
 import type { GitHubBackend } from "../src/github-backend";
 import { WorkerPool } from "../src/queue";
 import type { GitTransport } from "../src/sandbox";
+import { SlotPool } from "../src/slot-pool";
 import * as subprocess from "../src/subprocess";
 import { makeDb, makeSettings } from "./helpers";
 import { eventRow, makePool, recordRunning, stubSandbox } from "./queue-helpers";
@@ -111,15 +112,49 @@ test("stop aborts a hookless in-flight task", async () => {
 		controller.signal.throwIfAborted();
 		reachedSpawn = true;
 	})();
-	task.catch(() => {});
+	let settled = "pending" as "pending" | "fulfilled" | "rejected";
+	void task.then(
+		() => {
+			settled = "fulfilled";
+		},
+		() => {
+			settled = "rejected";
+		},
+	);
 	pool.inflightTasks.set(task, { deliveryId: "d-hookless", controller });
 	await preHookStarted;
 	await pool.stop({ drainTimeout: 0.05, killTimeout: 0.2 });
 	await Bun.sleep(0);
+	// stop() must terminate the hookless task (done + cancelled), not leave it running.
+	expect(settled).toBe("rejected");
 	expect(controller.signal.aborted).toBe(true);
-	await expect(task).rejects.toBeDefined();
 	expect(reachedSpawn).toBe(false);
 	expect(pool.shutdownCancelled.has("d-hookless")).toBe(true);
+});
+
+test("stop interrupts a runEvent parked on a saturated slot pool", async () => {
+	// Python cancels a task waiting in `SlotPool.acquire`; the TS abort must
+	// likewise withdraw the wait so dispatch never runs after stop() returns
+	// and the row stays `running` for the next start() to requeue.
+	const db = makeDb();
+	const slotPool = new SlotPool([2001]);
+	const pool = makePool(makeSettings(), db, slotPool);
+	recordRunning(db, "d-parked", "octo/widget#2");
+	const held = await slotPool.acquire();
+	const dispatched: string[] = [];
+	spyOn(pool, "dispatch").mockImplementation(async row => {
+		dispatched.push(row.delivery_id);
+	});
+	const task = pool.spawnEvent(eventRow({ delivery_id: "d-parked", issue_key: "octo/widget#2" }));
+	await Bun.sleep(0);
+	await pool.stop({ drainTimeout: 0.05, killTimeout: 0.5 });
+	expect(pool.inflightTasks.has(task)).toBe(false);
+	slotPool.release(held);
+	await Bun.sleep(0);
+	expect(dispatched).toEqual([]);
+	expect(db.getEvent("d-parked")?.state).toBe("running");
+	// The abandoned wait never strands the slot.
+	expect(await slotPool.acquire()).toBe(2001);
 });
 
 test("runEvent marks failed for an unrelated failure during drain", async () => {

@@ -69,10 +69,13 @@ export async function runWorkspaceOp<T>(op: () => Promise<T>, signal?: AbortSign
 	throw new TaskCancelledError();
 }
 
+/** Python `isinstance(value, Mapping)`: a JSON object, not an array. */
+function isMapping(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 function obj(value: unknown): Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value)
-		? (value as Record<string, unknown>)
-		: {};
+	return isMapping(value) ? value : {};
 }
 
 function commentFromPayload(payload: Json): CommentInfo {
@@ -389,12 +392,12 @@ export async function handleReleaseCi(args: TaskArgs): Promise<void> {
 	const { settings, db, github, sandbox, payload } = args;
 	const run = payload.workflow_run;
 	const repository = payload.repository;
-	if (typeof run !== "object" || run === null || typeof repository !== "object" || repository === null) {
+	if (!isMapping(run) || !isMapping(repository)) {
 		log.info("skip: incomplete release workflow payload");
 		return;
 	}
-	const runObj = obj(run);
-	const repoObj = obj(repository);
+	const runObj = run;
+	const repoObj = repository;
 	const repoFull = String(repoObj.full_name || "");
 	const defaultBranch = String(repoObj.default_branch || "");
 	const headSha = String(runObj.head_sha || "");
@@ -402,7 +405,7 @@ export async function handleReleaseCi(args: TaskArgs): Promise<void> {
 	const runUrl = String(runObj.html_url || "");
 	const conclusion = String(runObj.conclusion || "");
 	const headCommit = runObj.head_commit;
-	const message = typeof headCommit === "object" && headCommit !== null ? String(obj(headCommit).message || "") : "";
+	const message = isMapping(headCommit) ? String(headCommit.message || "") : "";
 	if (!repoFull || !defaultBranch || !headSha || !message.startsWith(settings.release_commit_prefix)) {
 		log.info("skip: unparseable release workflow", { repo: repoFull, sha: headSha });
 		return;
@@ -914,7 +917,8 @@ export async function cleanupWorkspace(args: {
 	const { db, sandbox, payload, targetState } = args;
 	const repoFull = String(obj(payload.repository).full_name || "");
 	if (!repoFull) return;
-	const issuePayload = obj(payload.issue ?? payload.pull_request);
+	// Python `payload.get("issue") or payload.get("pull_request") or {}`.
+	const issuePayload = obj(payload.issue || payload.pull_request);
 	const number = issuePayload.number;
 	if (typeof number !== "number" || !Number.isInteger(number)) return;
 	// A PR close maps to the originating issue.

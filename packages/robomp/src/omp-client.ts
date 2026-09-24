@@ -11,9 +11,10 @@
  * - Host tools reached through an `xd://` device report the transport tool
  *   (`write`) in `tool_execution_end`; events are renamed to the host tool
  *   that actually ran, keyed by the dispatch's `toolCallId`.
- * - `set_todos` and extension UI replies are not on the `RpcClient` surface:
- *   the adapter owns the spawned process, so it tees the agent's stdout to
- *   observe those frames and writes its own frames to stdin. Responses carry
+ * - `set_todos` and extension UI replies are not on the `RpcClient` surface,
+ *   and `RpcClient.prompt` drops a failed response: the adapter owns the
+ *   spawned process, so it tees the agent's stdout to observe those frames and
+ *   writes its own `set_todos` / `prompt` / UI frames to stdin. Responses carry
  *   `robomp_`-prefixed ids, which `RpcClient` ignores as uncorrelated.
  */
 import * as fs from "node:fs";
@@ -92,20 +93,27 @@ export class RpcProcessExitError extends Error {
 	}
 }
 
-/** Passive extension UI methods (notifications/status) need no response. */
-const PASSIVE_UI_METHODS = new Set(["notify", "setStatus", "setWidget", "setTitle", "set_editor_text", "open_url"]);
+/** Interactive extension UI methods that take a value; headless hosts cancel them. */
+const VALUE_UI_METHODS = new Set(["select", "input", "editor"]);
 
 /** Command frames the adapter sends itself, bypassing `RpcClient`. */
-type OwnCommand = Extract<RpcCommand, { type: "set_todos" }>;
+type OwnCommand = Extract<RpcCommand, { type: "set_todos" } | { type: "prompt" }>;
+
+/** An `OwnCommand` before the adapter assigns its request id. */
+type OwnCommandBody = OwnCommand extends infer C ? (C extends OwnCommand ? Omit<C, "id"> : never) : never;
 
 /** Prefix for adapter-owned request ids (never collides with `RpcClient`'s `req_N`). */
 const OWN_ID_PREFIX = "robomp_";
 
-/** Headless answer to an interactive extension UI request; `null` for passive methods. */
+/**
+ * Headless answer to an extension UI request (Python `install_headless_ui()`
+ * defaults): confirms are declined, select/input/editor are cancelled, and
+ * everything else (passive, `cancel`, unknown methods) goes unanswered.
+ */
 export function headlessUiResponse(request: RpcExtensionUIRequest): RpcExtensionUIResponse | null {
-	if (request.method === "cancel" || PASSIVE_UI_METHODS.has(request.method)) return null;
 	if (request.method === "confirm") return { type: "extension_ui_response", id: request.id, confirmed: false };
-	return { type: "extension_ui_response", id: request.id, cancelled: true };
+	if (VALUE_UI_METHODS.has(request.method)) return { type: "extension_ui_response", id: request.id, cancelled: true };
+	return null;
 }
 
 /** Resolve a group name via /etc/group (Python `grp.getgrnam`). */
@@ -144,13 +152,40 @@ function messageText(message: Record<string, unknown>): string | null {
 	return parts.join("");
 }
 
+/**
+ * Full message list of a terminal `agent_end`. An oversized frame is compacted
+ * on the wire to its non-streamed tail plus `messageCount`; the streamed
+ * prefix is rebuilt from the run's `message_end` events (Python
+ * `_complete_agent_end_messages`).
+ */
+function completeAgentEndMessages(events: AgentEvent[], terminal: AgentEvent & { type: "agent_end" }): AgentMessage[] {
+	const messageCount = (terminal as { messageCount?: unknown }).messageCount;
+	if (typeof messageCount !== "number" || messageCount <= terminal.messages.length) return terminal.messages;
+	let runStart = 0;
+	for (let i = events.length - 1; i >= 0; i--) {
+		if (events[i]!.type === "agent_start") {
+			runStart = i + 1;
+			break;
+		}
+	}
+	const streamed: AgentMessage[] = [];
+	for (const event of events.slice(runStart)) if (event.type === "message_end") streamed.push(event.message);
+	const prefixCount = messageCount - terminal.messages.length;
+	if (prefixCount > streamed.length) {
+		throw new Error(
+			`Compacted agent_end references ${prefixCount} streamed messages, but only ${streamed.length} were retained`,
+		);
+	}
+	return [...streamed.slice(0, prefixCount), ...terminal.messages];
+}
+
 /** Build a `PromptTurn` from the events of one prompt. */
 export function buildPromptTurn(events: AgentEvent[]): PromptTurn {
 	let messages: AgentMessage[] = [];
 	for (let i = events.length - 1; i >= 0; i--) {
 		const event = events[i]!;
 		if (event.type === "agent_end") {
-			messages = event.messages;
+			messages = completeAgentEndMessages(events.slice(0, i), event);
 			break;
 		}
 	}
@@ -302,7 +337,7 @@ export class RpcOmpClient implements OmpClient {
 		}
 	}
 
-	async #command(command: Omit<OwnCommand, "id">): Promise<RpcResponse> {
+	async #command(command: OwnCommandBody): Promise<RpcResponse> {
 		const proc = this.#process;
 		if (proc === null) throw new RpcProcessExitError("omp is not running");
 		const id = `${OWN_ID_PREFIX}${++this.#ownRequestId}`;
@@ -356,7 +391,13 @@ export class RpcOmpClient implements OmpClient {
 		});
 	}
 
+	/**
+	 * Kill the agent. Like Python `RpcClient.stop()`, a running client is first
+	 * marked closed with "RPC process stopped", so an in-flight prompt rejects
+	 * with that error rather than the exit watcher's.
+	 */
 	stop(): Promise<void> {
+		if (this.#started) this.markClosed(new RpcProcessExitError("RPC process stopped"));
 		return this.#client.stop();
 	}
 
@@ -387,10 +428,17 @@ export class RpcOmpClient implements OmpClient {
 
 	async promptAndWait(prompt: string, timeout: number): Promise<PromptTurn> {
 		if (this.#closed.error !== null) throw this.#closed.error;
-		const events = await Promise.race([
-			this.#client.promptAndWait(prompt, undefined, Math.max(1, Math.round(timeout * 1000))),
-			this.#closed.promise,
-		]);
+		// Subscribe before sending (Python snapshots the event index first). The
+		// collector is observed here so a rejected `prompt` never leaves it to
+		// reject unhandled when its timeout lapses.
+		const collected = this.#client.collectEvents(Math.max(1, Math.round(timeout * 1000)));
+		collected.catch(() => {});
+		// The prompt goes out as an adapter-owned command: `RpcClient.prompt`
+		// ignores a failed response, which would park the turn until the
+		// timeout, while Python's `prompt()` raises on it immediately.
+		const response = await this.#command({ type: "prompt", message: prompt });
+		if (!response.success) throw new Error(`prompt failed: ${response.error}`);
+		const events = await Promise.race([collected, this.#closed.promise]);
 		return buildPromptTurn(events);
 	}
 }

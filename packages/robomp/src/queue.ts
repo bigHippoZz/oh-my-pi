@@ -20,14 +20,30 @@ class Semaphore {
 	constructor(count: number) {
 		this.#available = count;
 	}
-	async acquire(): Promise<void> {
+	/**
+	 * Wait for a permit. An abort while queued withdraws the waiter (Python
+	 * cancelling a task parked in `Semaphore.acquire`) and throws.
+	 */
+	async acquire(signal?: AbortSignal): Promise<void> {
+		signal?.throwIfAborted();
 		if (this.#available > 0) {
 			this.#available -= 1;
 			return;
 		}
-		const { promise, resolve } = Promise.withResolvers<void>();
+		const { promise, resolve, reject } = Promise.withResolvers<void>();
 		this.#waiters.push(resolve);
-		await promise;
+		const onAbort = (): void => {
+			const index = this.#waiters.indexOf(resolve);
+			if (index < 0) return;
+			this.#waiters.splice(index, 1);
+			reject(signal?.reason);
+		};
+		signal?.addEventListener("abort", onAbort, { once: true });
+		try {
+			await promise;
+		} finally {
+			signal?.removeEventListener("abort", onAbort);
+		}
 	}
 	release(): void {
 		const next = this.#waiters.shift();
@@ -298,12 +314,12 @@ export class WorkerPool implements CancelSink {
 		let slotAcquired = false;
 		try {
 			if (this.slotPool !== null) {
-				slotUid = await this.slotPool.acquire();
+				slotUid = await acquireSlot(this.slotPool, signal);
 				slotAcquired = true;
 				signal?.throwIfAborted();
 				await this.#dispatchAndMark(row, slotUid, signal);
 			} else if (this.#semaphore !== null) {
-				await this.#semaphore.acquire();
+				await this.#semaphore.acquire(signal);
 				try {
 					signal?.throwIfAborted();
 					await this.#dispatchAndMark(row, null, signal);
@@ -459,6 +475,28 @@ export class WorkerPool implements CancelSink {
 			log.info("no-op dispatch", { event, action });
 		}
 	}
+}
+
+/**
+ * Acquire a slot, abandoning the wait when `signal` aborts (Python cancelling
+ * a task parked in `SlotPool.acquire`). A slot granted after the abort is
+ * handed straight back so it never leaks.
+ */
+async function acquireSlot(pool: SlotPool, signal: AbortSignal | undefined): Promise<number | null> {
+	signal?.throwIfAborted();
+	const acquiring = pool.acquire();
+	if (!signal) return acquiring;
+	const { promise: aborted, resolve } = Promise.withResolvers<"aborted">();
+	const onAbort = (): void => resolve("aborted");
+	signal.addEventListener("abort", onAbort, { once: true });
+	try {
+		const outcome = await Promise.race([acquiring.then(uid => ({ uid })), aborted]);
+		if (outcome !== "aborted") return outcome.uid;
+	} finally {
+		signal.removeEventListener("abort", onAbort);
+	}
+	void acquiring.then(uid => pool.release(uid));
+	throw signal.reason;
 }
 
 /** Wait up to `timeoutSeconds` for `tasks`; return those still unsettled. */
