@@ -7,7 +7,8 @@
 	"workspaces": {
 		"packages": [
 			"packages/*",
-			"python/robomp/web"
+			"python/robomp/web",
+			"packages/robomp/web"
 		],
 		"catalog": {
 			"@babel/generator": "^7.29.7",
@@ -148,6 +149,21 @@
 		"robomp:reset": "docker compose --project-directory python/robomp down -v && (docker image rm \"${PI_IMAGE:-oh-my-pi/pi:dev}\" || true)",
 		"robomp:web:dev": "bun --cwd=python/robomp/web run dev",
 		"robomp:web:build": "bun --cwd=python/robomp/web run build",
+		"robomp-ts:serve": "bun packages/robomp/src/cli.ts serve",
+		"robomp-ts:proxy": "bun packages/robomp/src/cli.ts proxy serve",
+		"robomp-ts:test": "bun --cwd=packages/robomp test",
+		"robomp-ts:test:integration": "ROBOMP_INTEGRATION=1 bun --cwd=packages/robomp test test/worker-smoke.test.ts",
+		"robomp-ts:test:permissions": "ROBOMP_PERMISSION_E2E=1 bun --cwd=packages/robomp test test/permissions-e2e.test.ts",
+		"robomp-ts:build": "bun run pi:image && docker compose --project-directory packages/robomp build",
+		"robomp-ts:rebuild": "bun run pi:image && docker compose --project-directory packages/robomp build --no-cache",
+		"robomp-ts:up": "docker compose --project-directory packages/robomp up -d",
+		"robomp-ts:down": "docker compose --project-directory packages/robomp down",
+		"robomp-ts:restart": "docker compose --project-directory packages/robomp restart robomp",
+		"robomp-ts:logs": "docker compose --project-directory packages/robomp logs -f robomp",
+		"robomp-ts:dev": "bun run robomp-ts:build && bun run robomp-ts:up && bun run robomp-ts:logs",
+		"robomp-ts:reset": "docker compose --project-directory packages/robomp down -v && (docker image rm \"${PI_IMAGE:-oh-my-pi/pi:dev}\" || true)",
+		"robomp-ts:web:dev": "bun --cwd=packages/robomp/web run dev",
+		"robomp-ts:web:build": "bun --cwd=packages/robomp/web run build",
 		"lint:py": "ruff check python && ruff format --check python",
 		"fix:py": "ruff check --fix python && ruff format python",
 		"prepublishOnly": "bun run check",

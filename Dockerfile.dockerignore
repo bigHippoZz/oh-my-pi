@@ -68,6 +68,8 @@ python/robomp/data/
 python/robomp/.cache/
 python/robomp/src/robomp/static/
 python/robomp/web/dist/
+packages/robomp/src/static/
+packages/robomp/web/dist/
 
 # Scratch files the repo creates ad-hoc.
 syntax.jsonl

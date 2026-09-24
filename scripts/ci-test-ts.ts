@@ -103,11 +103,13 @@ const nativeAndIntegrationPackages = [
 	"packages/tui",
 	"packages/collab-web",
 	"packages/typescript-edit-benchmark",
+	"packages/robomp",
 ];
 
 // Packages the CI buckets deliberately skip but a local full run should still
-// cover. robomp-web lives under python/robomp and is outside every CI TS bucket.
-const localOnlyWorkspacePackages = ["python/robomp/web"];
+// cover. The robomp dashboard bundles (python/robomp/web and its TypeScript-port
+// copy packages/robomp/web) are outside every CI TS bucket.
+const localOnlyWorkspacePackages = ["python/robomp/web", "packages/robomp/web"];
 
 const codingAgentNativePathPatterns = [
 	/(^|\/)[^/]*(bash|native|browser|cmux|mnemopi|hindsight|memory)[^/]*\.test\.ts$/i,

@@ -1,0 +1,4 @@
+# Vite build output (`bun run robomp-ts:web:build`); the build copies the
+# bundle into `src/static/`, which the server mounts at `/static`.
+src/static/
+web/dist/
