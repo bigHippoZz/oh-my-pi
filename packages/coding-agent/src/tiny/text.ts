@@ -210,19 +210,34 @@ export const NO_TITLE_SENTINEL = "none";
  */
 const MAX_TITLE_CHARS = 80;
 const MAX_TITLE_WORDS = 12;
+/**
+ * Han and kana, which Chinese and Japanese write without spaces between words:
+ * {@link TITLE_WORD} reads a whole such sentence as one word, so the word bound
+ * cannot tell a title in these scripts from an answer.
+ */
+const UNSPACED_SCRIPT = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}]/u;
+/**
+ * Full-width clause and sentence punctuation. A title is one phrase, so one of
+ * these left inside a Han/kana title splits it into clauses: an answer. The
+ * enumeration comma `、` is not one; titles list items with it.
+ */
+const CLAUSE_PUNCTUATION = /[。！？；，]/u;
 
 export function normalizeGeneratedTitle(value: string | null | undefined, sourceText?: string): string | null {
 	const firstLine = value?.trim().split(/\r?\n/, 1)[0]?.trim();
 	if (!firstLine) return null;
 	const unquoted = firstLine.replace(/^["']|["']$/g, "").trim();
 	if (/^<title\s*\/>$/i.test(unquoted)) return null;
-	const title = unquoted
+	const stripped = unquoted
 		.replace(/^<title>/i, "")
 		.replace(/<\/title>$/i, "")
 		.replace(/^["']|["']$/g, "")
 		.replace(/[.!?]$/, "")
 		.trim();
+	const unspaced = UNSPACED_SCRIPT.test(stripped);
+	const title = unspaced ? stripped.replace(/[。！？]$/u, "").trimEnd() : stripped;
 	if (!title || title.toLowerCase() === NO_TITLE_SENTINEL) return null;
+	if (unspaced && CLAUSE_PUNCTUATION.test(title)) return null;
 	// Zero word characters means pure punctuation/symbol junk (e.g. ".."), which
 	// a sampling model occasionally emits instead of a title; reject so the
 	// caller defers titling rather than naming the session "..".
