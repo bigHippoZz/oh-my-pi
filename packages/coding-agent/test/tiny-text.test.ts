@@ -200,14 +200,18 @@ describe("normalizeGeneratedTitle", () => {
 		expect(
 			normalizeGeneratedTitle("人生的意义因人而异，很多哲学家认为意义需要自己去创造", "人生的意义是啥"),
 		).toBeNull();
+		// Japanese writes its clause comma as `、`, which Chinese titles use only to list items.
+		expect(normalizeGeneratedTitle("私はAIアシスタントで、質問に答えます。", "あなたは誰")).toBeNull();
 	});
 
-	it("keeps a long or question-form Chinese title, minus its trailing terminator", () => {
-		expect(normalizeGeneratedTitle("[修复] 手机端登录按钮在横屏模式下点击无响应的问题")).toBe(
+	it("keeps a Chinese title whose punctuation splits no clause, minus its trailing terminator", () => {
+		expect(normalizeGeneratedTitle("[修复] 手机端登录按钮在横屏模式下点击无响应的问题。")).toBe(
 			"[修复] 手机端登录按钮在横屏模式下点击无响应的问题",
 		);
 		expect(normalizeGeneratedTitle("[提问] 人生的意义是什么？")).toBe("[提问] 人生的意义是什么");
-		expect(normalizeGeneratedTitle("[新增] 导入、导出功能")).toBe("[新增] 导入、导出功能");
+		expect(normalizeGeneratedTitle("[新增] 导入、导出功能。")).toBe("[新增] 导入、导出功能");
+		// Bracketed punctuation is the title's subject, not a clause break.
+		expect(normalizeGeneratedTitle("修复中文逗号（，）解析错误。")).toBe("修复中文逗号（，）解析错误");
 	});
 });
 
